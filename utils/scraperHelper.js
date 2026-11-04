@@ -781,7 +781,7 @@ function buildGoogleSearchUrl(query, start = 0) {
 // ScraperAPI proxy (optional)
 // ---------------------------------------------------------------------------
 
-const SCRAPER_API_ENDPOINT = 'http://api.scraperapi.com';
+const SCRAPER_API_ENDPOINT = 'https://api.scraperapi.com';
 
 // ScraperAPI solves Google's JS retry page in its own browser, which routinely
 // takes longer than a direct scrape, so proxied requests get extra headroom.
