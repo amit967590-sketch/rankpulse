@@ -788,6 +788,10 @@ function buildGoogleSearchUrl(query, start = 0) {
 
 const SCRAPER_API_ENDPOINT = 'https://api.scraperapi.com';
 
+// Google requests are rendered in a real browser (render=true) and exit from an
+// Indian IP (country_code=in), which is what gets past the JS retry challenge.
+const SCRAPER_API_GOOGLE_PARAMS = 'country_code=in&render=true';
+
 // ScraperAPI solves Google's JS retry page in its own browser, which routinely
 // takes longer than a direct scrape, so proxied requests get extra headroom.
 const SCRAPER_API_MIN_TIMEOUT_MS = 60000;
@@ -799,14 +803,15 @@ function getScraperApiKey() {
 /**
  * Wrap `targetUrl` in a ScraperAPI request. ScraperAPI fetches the URL from
  * its own IPs (so datacenter blocks and the JavaScript retry page are handled
- * upstream) and returns the same Google HTML. Returns null when no key is
- * configured, which makes callers fall back to a direct request.
+ * upstream) and returns the engine response HTML unchanged. Returns null when
+ * no key is configured, which makes callers hit the engine directly.
  */
-function buildScraperApiUrl(targetUrl) {
+function buildScraperApiUrl(targetUrl, extraQuery = '') {
   const apiKey = getScraperApiKey();
   if (!apiKey) return null;
 
-  return `${SCRAPER_API_ENDPOINT}?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}`;
+  const suffix = extraQuery ? `&${extraQuery}` : '';
+  return `${SCRAPER_API_ENDPOINT}?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}${suffix}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -825,9 +830,12 @@ async function requestPage({
   signal,
 }) {
   let lastError;
-  // Route Google through ScraperAPI when a key is configured; otherwise hit
-  // Google directly with BROWSER_HEADERS.
-  const scraperApiUrl = engine === 'google' ? buildScraperApiUrl(url) : null;
+  // Both engines go through ScraperAPI when a key is configured, so Render's
+  // IP is never sent to Google or DuckDuckGo directly.
+  const scraperApiUrl = buildScraperApiUrl(
+    url,
+    engine === 'google' ? SCRAPER_API_GOOGLE_PARAMS : ''
+  );
   const viaScraperApi = Boolean(scraperApiUrl);
   const provider = viaScraperApi ? 'ScraperAPI' : engineLabel(engine);
 
@@ -1002,6 +1010,50 @@ function buildNotFoundResult({
       `No match found for "${targetDomain}" after scanning ` +
       `${resultsScanned} organic ${resultWord} across ${pagesChecked} ` +
       `${pageWord} on ${engineLabel(engine)}.`,
+  };
+}
+
+const BLOCKED_MESSAGE =
+  'Search engines are temporarily rate-limiting requests from this server, so ' +
+  'the ranking could not be measured. Please try again in a minute.';
+
+const UNAVAILABLE_MESSAGE =
+  'Search results could not be fetched right now, so the ranking could not be ' +
+  'measured. Please try again in a minute.';
+
+/**
+ * Soft failure: the ranking is not claimed, but callers still receive a normal
+ * result object with a readable message instead of a thrown scraper error, so a
+ * block page never surfaces as a verification-challenge popup.
+ */
+function buildUnavailableResult({
+  engine,
+  keyword,
+  targetDomain,
+  checkedAt,
+  code,
+  message,
+}) {
+  return {
+    found: false,
+    keyword,
+    domain: targetDomain,
+    engine,
+    position: null,
+    page: null,
+    url: null,
+    title: null,
+    snippet: null,
+    resultDomain: null,
+    displayUrl: null,
+    resultsScanned: 0,
+    scannedResults: 0,
+    pagesChecked: 0,
+    checkedAt,
+    unavailable: true,
+    blocked: ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(code),
+    code: code || 'REQUEST_FAILED',
+    message,
   };
 }
 
@@ -1201,6 +1253,11 @@ async function scanDuckDuckGo({
 
     if (page >= maxPages) break;
 
+    // ScraperAPI only fetches a URL with GET, while DuckDuckGo's later pages
+    // are a POST of the hidden next-page form. A proxied fallback therefore
+    // stops after the first page instead of exposing this server's IP.
+    if (getScraperApiKey()) break;
+
     const nextForm = extractNextPageForm($);
     if (!nextForm) break;
 
@@ -1252,9 +1309,54 @@ async function scanDuckDuckGo({
  * @param {'google'|'duckduckgo'} [options.engine]    Primary engine (default: SEARCH_ENGINE or google).
  * @param {boolean} [options.fallbackToDuckDuckGo]    Fall back to DDG when Google is blocked or empty (default: true).
  * @param {AbortSignal} [options.signal]              Optional abort signal.
- * @returns {Promise<object>} Ranking result. `found` is false when the domain is not in the scanned pages.
+ * @returns {Promise<object>} Ranking result. `found` is false when the domain is not in the scanned pages, and `unavailable` is true when no engine could be read at all.
  */
 async function checkKeywordRank(domain, keyword, options = {}) {
+  try {
+    return await runKeywordCheck(domain, keyword, options);
+  } catch (error) {
+    if (
+      options?.signal?.aborted ||
+      error?.name === 'AbortError' ||
+      error?.code === 'ERR_CANCELED'
+    ) {
+      throw error;
+    }
+
+    if (
+      error instanceof ScraperError &&
+      (error.code === 'INVALID_DOMAIN' || error.code === 'INVALID_KEYWORD')
+    ) {
+      throw error;
+    }
+
+    // Unexpected failure (unparsable block page, socket error, ...): answer with
+    // a readable message rather than letting a raw error break the UI.
+    let safeDomain = String(domain ?? '').trim();
+    let safeKeyword = String(keyword ?? '').trim();
+    try {
+      safeDomain = normalizeDomain(domain);
+    } catch {
+      /* keep the raw value */
+    }
+    try {
+      safeKeyword = normalizeKeyword(keyword);
+    } catch {
+      /* keep the raw value */
+    }
+
+    return buildUnavailableResult({
+      engine: normalizeEngine(options?.engine ?? DEFAULTS.engine),
+      keyword: safeKeyword,
+      targetDomain: safeDomain,
+      checkedAt: new Date().toISOString(),
+      code: error?.code || 'REQUEST_FAILED',
+      message: UNAVAILABLE_MESSAGE,
+    });
+  }
+}
+
+async function runKeywordCheck(domain, keyword, options = {}) {
   const targetDomain = normalizeDomain(domain);
   const query = normalizeKeyword(keyword);
 
@@ -1338,36 +1440,21 @@ async function checkKeywordRank(domain, keyword, options = {}) {
   }
 
   const lastAttempt = attempts[attempts.length - 1];
-  const challengeAttempt = attempts.find((attempt) =>
-    ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(attempt.code)
-  );
+  const blockedAttempt =
+    attempts.find((attempt) =>
+      ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(attempt.code)
+    ) || lastAttempt;
 
-  if (challengeAttempt) {
-    const providers = [
-      ...new Set(attempts.map((attempt) => engineLabel(attempt.engine))),
-    ].join(' and ');
-    const googleOnly = attempts.every((attempt) => attempt.engine === 'google');
-
-    throw new ScraperError(
-      googleOnly
-        ? 'Google returned a JavaScript-only retry page, captcha, or consent ' +
-            'screen instead of organic results. Wait a few minutes, then try again.'
-        : `${providers} could not return organic results (captcha, consent, ` +
-            'or a JavaScript-only response). Wait a few minutes, then try again.',
-      { code: 'CHALLENGE', status: 503, cause: lastAttempt?.error }
-    );
-  }
-
-  throw new ScraperError(
-    `Unable to fetch search results: ${
-      lastAttempt?.message || 'unknown error'
-    }`,
-    {
-      code: lastAttempt?.code || 'REQUEST_FAILED',
-      status: lastAttempt?.error?.status,
-      cause: lastAttempt?.error,
-    }
-  );
+  return buildUnavailableResult({
+    engine: blockedAttempt?.engine || primaryEngine,
+    keyword: query,
+    targetDomain,
+    checkedAt,
+    code: blockedAttempt?.code || 'REQUEST_FAILED',
+    message: ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(blockedAttempt?.code)
+      ? BLOCKED_MESSAGE
+      : UNAVAILABLE_MESSAGE,
+  });
 }
 
 module.exports = {
