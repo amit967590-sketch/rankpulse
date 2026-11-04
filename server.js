@@ -12,15 +12,24 @@ const { checkKeywordRank, ScraperError } = require('./utils/scraperHelper');
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// Deep-scan configuration: each DuckDuckGo HTML page returns roughly 10
-// organic results, so 10 pages covers approximately 100 positions.
-const DEFAULT_MAX_RESULT_PAGES = 10;
+// Deep-scan configuration: each Google/DuckDuckGo HTML page returns roughly
+// 10 organic results, so the 5-page default covers ~50 positions. The limit is
+// capped at 10 pages (~100 results) for deeper scans.
+const DEFAULT_MAX_RESULT_PAGES = 5;
 const MAX_RESULT_PAGES_LIMIT = 10;
 const configuredMaxResultPages = Number(process.env.MAX_RESULT_PAGES);
 const MAX_RESULT_PAGES =
   Number.isFinite(configuredMaxResultPages) && configuredMaxResultPages > 0
     ? Math.min(Math.floor(configuredMaxResultPages), MAX_RESULT_PAGES_LIMIT)
     : DEFAULT_MAX_RESULT_PAGES;
+
+// Google is the primary SERP source. The scraper falls back to DuckDuckGo
+// automatically when Google serves a captcha/consent page or is unavailable.
+const SEARCH_ENGINE =
+  String(process.env.SEARCH_ENGINE || 'google').trim().toLowerCase() ===
+  'duckduckgo'
+    ? 'duckduckgo'
+    : 'google';
 
 // Trust the first proxy so client IPs (and rate limiting) work correctly
 // when the app runs behind a reverse proxy such as nginx or a PaaS router.
@@ -109,21 +118,34 @@ app.post('/api/check-rank', async (req, res) => {
   try {
     const result = await checkKeywordRank(domain, keyword, {
       maxPages: MAX_RESULT_PAGES,
+      engine: SEARCH_ENGINE,
     });
+
+    const resultsScanned = Number.isFinite(result.resultsScanned)
+      ? result.resultsScanned
+      : Number.isFinite(result.scannedResults)
+        ? result.scannedResults
+        : 0;
 
     return res.status(200).json({
       success: true,
       found: result.found,
       domain: result.domain,
       keyword: result.keyword,
+      engine: result.engine,
       position: result.position,
       page: result.page,
       url: result.url,
       title: result.title,
       snippet: result.snippet,
-      scannedResults: result.scannedResults,
+      resultsScanned,
+      // Kept for backwards compatibility with the existing frontend.
+      scannedResults: resultsScanned,
       pagesChecked: result.pagesChecked,
       checkedAt: result.checkedAt,
+      message: result.message || null,
+      fallback: result.fallback === true,
+      fallbackFrom: result.fallbackFrom || null,
     });
   } catch (error) {
     if (error instanceof ScraperError) {
@@ -132,6 +154,9 @@ app.post('/api/check-rank', async (req, res) => {
         INVALID_KEYWORD: 400,
         CHALLENGE: 503,
         BLOCKED: 503,
+        CONSENT: 503,
+        EMPTY_RESULTS: 502,
+        INSUFFICIENT_RESULTS: 502,
         HTTP_ERROR: 502,
         REQUEST_FAILED: 502,
       };

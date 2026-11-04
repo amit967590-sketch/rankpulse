@@ -1,12 +1,13 @@
 # RankPulse — Free Keyword Rank Checker & SEO Rank Tracker
 
-A small Node.js/Express app that checks where a domain ranks in DuckDuckGo search results. It scrapes the public HTML SERP directly — no paid API keys, no accounts, no database.
+A small Node.js/Express app that checks where a domain ranks in Google search results, with an automatic DuckDuckGo fallback. It scrapes the public HTML SERP directly — no paid API keys, no accounts, no database.
 
 ## Features
 
-- **Free rank checks** against live DuckDuckGo results
-- **Deep SERP scans** — checks up to 10 DuckDuckGo pages (~100 organic results) so lower-ranking domains are still found
-- **Position and page** for the matched result (or a clear “not found” state)
+- **Google-first rank checks** against live Google organic results
+- **Automatic DuckDuckGo fallback** when Google serves a captcha, consent page, or is unavailable
+- **Deep SERP scans** — 5 pages by default (~50 organic results), configurable up to 10 pages (~100 results), so lower-ranking domains are still found
+- **Position and page** for the matched result (or a clear “not found” state with scan counts)
 - **Smart request handling** — randomized browser headers, user-agent rotation, and jittered pacing
 - **Polished dark UI** with responsive layouts, loading states, result cards, and error toasts
 - **On-page SEO** — keyword-focused title/description, Open Graph and Twitter cards, JSON-LD, and semantic heading structure
@@ -46,33 +47,56 @@ Successful response:
   "found": true,
   "domain": "expressjs.com",
   "keyword": "express framework",
-  "position": 1,
+  "engine": "google",
+  "position": 7,
   "page": 1,
   "url": "https://expressjs.com/",
   "title": "Express.js · Node.js web application framework",
   "snippet": "Fast, unopinionated, minimalist web framework for Node.js",
-  "scannedResults": 10,
-  "pagesChecked": 1,
-  "checkedAt": "2026-11-04T09:03:00.000Z"
+  "resultsScanned": 30,
+  "scannedResults": 30,
+  "pagesChecked": 3,
+  "checkedAt": "2026-11-04T09:03:00.000Z",
+  "message": null,
+  "fallback": false
 }
 ```
+
+When the domain is not found, the endpoint still returns `200` with a clear message and the real scan counts:
+
+```json
+{
+  "success": true,
+  "found": false,
+  "engine": "google",
+  "position": null,
+  "resultsScanned": 50,
+  "pagesChecked": 5,
+  "message": "No match found for \"example.com\" after scanning 50 organic results across 5 pages on Google."
+}
+```
+
+`resultsScanned` is the number of organic results actually parsed. `pagesChecked` is the number of SERP pages actually fetched. `scannedResults` is retained as a backwards-compatible alias.
 
 Error responses use a stable shape:
 
 ```json
-{ "success": false, "code": "CHALLENGE", "error": "DuckDuckGo returned a verification challenge." }
+{ "success": false, "code": "CHALLENGE", "error": "Google and DuckDuckGo could not return organic results right now (captcha, consent, or a JavaScript-only response). Wait about a minute, then try again." }
 ```
 
-| Status | Code               | Meaning                                        |
-| ------ | ------------------ | ---------------------------------------------- |
-| 400    | `VALIDATION_ERROR` | `domain` or `keyword` is missing               |
-| 400    | `INVALID_DOMAIN`   | The domain could not be parsed                 |
-| 429    | —                  | Rate limit exceeded                            |
-| 502    | `HTTP_ERROR`       | DuckDuckGo returned an unexpected status       |
-| 502    | `REQUEST_FAILED`   | The search request failed (network/timeout)    |
-| 503    | `CHALLENGE`        | DuckDuckGo served a bot-verification page      |
-| 503    | `BLOCKED`          | The search provider is rate-limiting requests  |
-| 500    | `INTERNAL_ERROR`   | Unexpected server error                        |
+| Status | Code                   | Meaning                                           |
+| ------ | ---------------------- | ------------------------------------------------- |
+| 400    | `VALIDATION_ERROR`     | `domain` or `keyword` is missing                  |
+| 400    | `INVALID_DOMAIN`       | The domain could not be parsed                    |
+| 429    | —                      | Rate limit exceeded                               |
+| 502    | `HTTP_ERROR`           | The search provider returned an unexpected status |
+| 502    | `REQUEST_FAILED`       | The search request failed (network/timeout)       |
+| 502    | `EMPTY_RESULTS`        | No organic results could be parsed                |
+| 502    | `INSUFFICIENT_RESULTS` | The provider stopped before a full scan           |
+| 503    | `CHALLENGE`            | A search engine served a captcha/challenge page   |
+| 503    | `BLOCKED`              | The search provider is rate-limiting requests     |
+| 503    | `CONSENT`              | Google served a consent page instead of results   |
+| 500    | `INTERNAL_ERROR`       | Unexpected server error                           |
 
 ### `GET /health` and `GET /api/health`
 
@@ -82,21 +106,23 @@ Return service status, version, timestamp, and uptime.
 
 Settings live in `.env` (see `.env.example`):
 
-| Variable             | Default | Purpose                                          |
-| -------------------- | ------- | ------------------------------------------------ |
-| `PORT`               | `3000`  | HTTP port                                        |
-| `ALLOWED_ORIGINS`    | empty   | Comma-separated CORS allow-list (empty = any)    |
-| `RATE_LIMIT_WINDOW_MS` | `900000` | Rate-limit window in milliseconds             |
-| `RATE_LIMIT_MAX`     | `100`   | Requests allowed per window per IP               |
-| `MAX_RESULT_PAGES`   | `10`    | SERP pages to scan per check (~100 results)      |
-| `REQUEST_DELAY_MS`   | `1000`  | Delay between paginated requests                 |
-| `REQUEST_TIMEOUT_MS` | `15000` | Outbound request timeout                         |
+| Variable             | Default  | Purpose                                             |
+| -------------------- | -------- | --------------------------------------------------- |
+| `PORT`               | `3000`   | HTTP port                                           |
+| `ALLOWED_ORIGINS`    | empty    | Comma-separated CORS allow-list (empty = any)       |
+| `RATE_LIMIT_WINDOW_MS` | `900000` | Rate-limit window in milliseconds                 |
+| `RATE_LIMIT_MAX`     | `100`    | Requests allowed per window per IP                  |
+| `SEARCH_ENGINE`      | `google` | Primary engine: `google` or `duckduckgo`            |
+| `DUCKDUCKGO_FALLBACK`| `true`   | Fall back to DDG when Google is blocked/unavailable |
+| `MAX_RESULT_PAGES`   | `5`      | Pages to scan (5 ≈ 50 results, max 10)              |
+| `REQUEST_DELAY_MS`   | `1000`   | Delay between paginated requests                    |
+| `REQUEST_TIMEOUT_MS` | `15000`  | Outbound request timeout                            |
 
 ## Project structure
 
 ```
 server.js               Express app, API routes, static hosting
-utils/scraperHelper.js  DuckDuckGo scraping, parsing, and matching
+utils/scraperHelper.js  Google/DuckDuckGo scraping, parsing, and matching
 public/index.html       Frontend markup and SEO metadata
 public/styles.css       Dark responsive design system
 public/app.js           Form, fetch, result rendering, toasts
@@ -111,9 +137,10 @@ public/og-image.png     1200×630 social preview image
 
 ## Notes
 
-- DuckDuckGo can occasionally serve a `202` verification challenge during rapid or repeated checks. The API maps this to `503 CHALLENGE`; wait about a minute and retry.
+- Google frequently serves captchas or consent pages to automated traffic. When that happens, the scraper automatically retries the same query on DuckDuckGo and returns `engine: "duckduckgo"` with `fallback: true`.
+- If both providers are blocked, the API maps this to `503 CHALLENGE`; wait about a minute and retry.
 - Rankings vary by region, personalization, and time. Results are a point-in-time snapshot.
-- This project is not affiliated with DuckDuckGo.
+- This project is not affiliated with Google or DuckDuckGo.
 
 ## License
 

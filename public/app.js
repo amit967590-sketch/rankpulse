@@ -136,6 +136,12 @@
     }
   }
 
+  function engineName(value) {
+    if (value === 'duckduckgo') return 'DuckDuckGo';
+    if (value === 'google') return 'Google';
+    return 'Google';
+  }
+
   /* ------------------------------------------------------------------------
      Results rendering
      ------------------------------------------------------------------------ */
@@ -146,6 +152,8 @@
     const keyword = data.keyword || keywordInput.value.trim();
     const safeUrl = found ? safeHttpUrl(data.url) : null;
     const pagesChecked = Number(data.pagesChecked);
+    const resultsScanned =
+      data.resultsScanned === undefined ? data.scannedResults : data.resultsScanned;
 
     resultCard.classList.toggle('is-miss', !found);
 
@@ -187,13 +195,15 @@
       resultUrl.removeAttribute('href');
       resultUrl.textContent = '';
 
-      const scanned = formatCount(data.scannedResults);
+      const scanned = formatCount(resultsScanned);
       const pages = formatCount(data.pagesChecked);
       const pageWord = Number(data.pagesChecked) === 1 ? 'page' : 'pages';
 
       resultSnippet.textContent =
-        `We scanned ${scanned} results across ${pages} ${pageWord} for “${keyword}” ` +
-        `but couldn’t find ${domain}. Try a broader keyword or run the check again.`;
+        data.message ||
+        `We scanned ${scanned} organic results across ${pages} ${pageWord} for ` +
+          `“${keyword}” but couldn’t find ${domain}. Try a broader keyword or run ` +
+          'the check again.';
     }
 
     resultTags.replaceChildren();
@@ -205,10 +215,10 @@
 
     const sourceTag = document.createElement('span');
     sourceTag.className = 'result-tag';
-    sourceTag.textContent = 'Source: DuckDuckGo';
+    sourceTag.textContent = `Source: ${engineName(data.engine)}`;
     resultTags.append(sourceTag);
 
-    summaryScanned.textContent = formatCount(data.scannedResults);
+    summaryScanned.textContent = formatCount(resultsScanned);
     summaryPages.textContent = formatCount(data.pagesChecked);
     summaryTime.textContent = formatDateTime(data.checkedAt);
   }
@@ -257,11 +267,11 @@
      ------------------------------------------------------------------------ */
 
   function friendlyError(error) {
-    if (error.code === 'CHALLENGE') {
+    if (error.code === 'CHALLENGE' || error.code === 'CONSENT') {
       return {
         title: 'Verification challenge',
         message:
-          'DuckDuckGo is asking for a quick bot check. Wait about a minute, then try again.',
+          'The search engine is asking for a quick bot check. Wait about a minute, then try again.',
       };
     }
 
@@ -284,12 +294,15 @@
     if (
       error.code === 'HTTP_ERROR' ||
       error.code === 'REQUEST_FAILED' ||
+      error.code === 'EMPTY_RESULTS' ||
+      error.code === 'INSUFFICIENT_RESULTS' ||
       error.status === 502 ||
       error.status === 503
     ) {
       return {
         title: 'Search provider unavailable',
-        message: 'DuckDuckGo did not respond as expected. Please try again in a moment.',
+        message:
+          'Google and DuckDuckGo did not respond as expected. Please try again in a moment.',
       };
     }
 
