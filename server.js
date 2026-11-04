@@ -12,6 +12,16 @@ const { checkKeywordRank, ScraperError } = require('./utils/scraperHelper');
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+// Deep-scan configuration: each DuckDuckGo HTML page returns roughly 10
+// organic results, so 10 pages covers approximately 100 positions.
+const DEFAULT_MAX_RESULT_PAGES = 10;
+const MAX_RESULT_PAGES_LIMIT = 10;
+const configuredMaxResultPages = Number(process.env.MAX_RESULT_PAGES);
+const MAX_RESULT_PAGES =
+  Number.isFinite(configuredMaxResultPages) && configuredMaxResultPages > 0
+    ? Math.min(Math.floor(configuredMaxResultPages), MAX_RESULT_PAGES_LIMIT)
+    : DEFAULT_MAX_RESULT_PAGES;
+
 // Trust the first proxy so client IPs (and rate limiting) work correctly
 // when the app runs behind a reverse proxy such as nginx or a PaaS router.
 app.set('trust proxy', 1);
@@ -97,7 +107,9 @@ app.post('/api/check-rank', async (req, res) => {
   }
 
   try {
-    const result = await checkKeywordRank(domain, keyword);
+    const result = await checkKeywordRank(domain, keyword, {
+      maxPages: MAX_RESULT_PAGES,
+    });
 
     return res.status(200).json({
       success: true,

@@ -35,7 +35,7 @@ function toNonNegativeInt(value, fallback) {
 }
 
 const DEFAULTS = {
-  maxPages: toPositiveInt(process.env.MAX_RESULT_PAGES, 5),
+  maxPages: toPositiveInt(process.env.MAX_RESULT_PAGES, 10),
   requestDelayMs: toNonNegativeInt(process.env.REQUEST_DELAY_MS, 1000),
   timeoutMs: toPositiveInt(process.env.REQUEST_TIMEOUT_MS, 15000),
   retries: 1,
@@ -533,7 +533,7 @@ async function requestPage({
  * @param {string} domain  Domain or URL, e.g. "example.com" or "https://www.example.com".
  * @param {string} keyword Search query.
  * @param {object} [options]
- * @param {number} [options.maxPages]           Maximum result pages to scan (default: MAX_RESULT_PAGES or 5).
+ * @param {number} [options.maxPages]           Maximum result pages to scan (default: MAX_RESULT_PAGES or 10, ~100 results).
  * @param {number} [options.requestDelayMs]     Delay between page requests in ms (default: REQUEST_DELAY_MS or 1000).
  * @param {number} [options.timeoutMs]          Per-request timeout in ms (default: REQUEST_TIMEOUT_MS or 15000).
  * @param {number} [options.retries]            Retry attempts per page request (default: 1).

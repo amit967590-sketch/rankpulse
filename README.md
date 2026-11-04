@@ -5,6 +5,7 @@ A small Node.js/Express app that checks where a domain ranks in DuckDuckGo searc
 ## Features
 
 - **Free rank checks** against live DuckDuckGo results
+- **Deep SERP scans** — checks up to 10 DuckDuckGo pages (~100 organic results) so lower-ranking domains are still found
 - **Position and page** for the matched result (or a clear “not found” state)
 - **Smart request handling** — randomized browser headers, user-agent rotation, and jittered pacing
 - **Polished dark UI** with responsive layouts, loading states, result cards, and error toasts
@@ -87,7 +88,7 @@ Settings live in `.env` (see `.env.example`):
 | `ALLOWED_ORIGINS`    | empty   | Comma-separated CORS allow-list (empty = any)    |
 | `RATE_LIMIT_WINDOW_MS` | `900000` | Rate-limit window in milliseconds             |
 | `RATE_LIMIT_MAX`     | `100`   | Requests allowed per window per IP               |
-| `MAX_RESULT_PAGES`   | `5`     | SERP pages to scan per check                     |
+| `MAX_RESULT_PAGES`   | `10`    | SERP pages to scan per check (~100 results)      |
 | `REQUEST_DELAY_MS`   | `1000`  | Delay between paginated requests                 |
 | `REQUEST_TIMEOUT_MS` | `15000` | Outbound request timeout                         |
 
