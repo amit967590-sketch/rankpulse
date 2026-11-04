@@ -22,19 +22,13 @@ const GOOGLE_ORIGIN = 'https://www.google.com';
 const GOOGLE_SEARCH_URL = 'https://www.google.com/search';
 const DUCKDUCKGO_SEARCH_URL = 'https://html.duckduckgo.com/html/';
 const DUCKDUCKGO_ORIGIN = 'https://html.duckduckgo.com';
-const BROWSER_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br'
-};
+
 // Google shows 10 organic results per HTML result page.
 const GOOGLE_RESULTS_PER_PAGE = 10;
 
-// A 3-5 page scan should yield 30-50 organic results. If Google stops early
-// with fewer results, the DuckDuckGo fallback is given a chance to fill in a
-// complete scan.
-const MIN_ORGANIC_RESULTS = 30;
+// Collect up to 30 organic links (three Google result pages) per check. The
+// scan stops early as soon as the target domain is matched.
+const TARGET_ORGANIC_RESULTS = 30;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -68,11 +62,16 @@ function engineLabel(engine) {
 
 const DEFAULTS = {
   maxPages: toPositiveInt(process.env.MAX_RESULT_PAGES, 5),
+  targetResults: toPositiveInt(
+    process.env.TARGET_ORGANIC_RESULTS,
+    TARGET_ORGANIC_RESULTS
+  ),
   requestDelayMs: toNonNegativeInt(process.env.REQUEST_DELAY_MS, 1000),
   timeoutMs: toPositiveInt(process.env.REQUEST_TIMEOUT_MS, 15000),
   retries: 1,
   engine: normalizeEngine(process.env.SEARCH_ENGINE || 'google'),
-  fallbackToDuckDuckGo: toBoolean(process.env.DUCKDUCKGO_FALLBACK, true),
+  // Google is the source of truth. DuckDuckGo is now opt-in only.
+  fallbackToDuckDuckGo: toBoolean(process.env.DUCKDUCKGO_FALLBACK, false),
 };
 
 class ScraperError extends Error {
@@ -192,6 +191,52 @@ function buildHeaders({ referer, origin, contentType } = {}) {
   if (referer) headers.Referer = referer;
   if (origin) headers.Origin = origin;
   if (contentType) headers['Content-Type'] = contentType;
+
+  return headers;
+}
+
+/**
+ * Dedicated Google request headers: a stable, current Windows Chrome profile
+ * with matching Client Hints, English locale, and a consent cookie. Keeping a
+ * coherent header set (instead of mixing random profiles) gives Google far
+ * fewer reasons to serve its JavaScript-only retry page.
+ */
+const GOOGLE_CHROME_PROFILE = BROWSER_PROFILES[0];
+const GOOGLE_CONSENT_COOKIE =
+  'SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+410';
+
+/**
+ * Browser header set sent with every Google SERP request. These must reach
+ * axios (see requestPage) or Google treats the caller as a bare HTTP client and
+ * answers datacenter IPs with its JavaScript-only retry page.
+ */
+const BROWSER_HEADERS = {
+  'User-Agent': GOOGLE_CHROME_PROFILE.userAgent,
+  Accept: CHROME_ACCEPT,
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'no-cache',
+  Pragma: 'no-cache',
+  DNT: '1',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  Connection: 'keep-alive',
+  'sec-ch-ua': GOOGLE_CHROME_PROFILE.chUa,
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': GOOGLE_CHROME_PROFILE.platform,
+  Cookie: GOOGLE_CONSENT_COOKIE,
+};
+
+function buildGoogleHeaders({ referer } = {}) {
+  const headers = { ...BROWSER_HEADERS };
+
+  if (referer) {
+    headers.Referer = referer;
+    headers['Sec-Fetch-Site'] = 'same-origin';
+  }
 
   return headers;
 }
@@ -468,6 +513,8 @@ const DUCKDUCKGO_CHALLENGE_PATTERNS = [
 ];
 
 const GOOGLE_CHALLENGE_PATTERNS = [
+  /\/httpservice\/retry\/enablejs/i,
+  /enablejs\?sei=/i,
   /id=["']captcha-form["']/i,
   /\/sorry\/index/i,
   /detected unusual traffic/i,
@@ -750,15 +797,22 @@ async function requestPage({
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
+      // Google gets BROWSER_HEADERS (buildGoogleHeaders spreads it and adds
+      // the referer); other engines get a rotated browser profile.
+      const headers =
+        engine === 'google'
+          ? buildGoogleHeaders({ referer })
+          : buildHeaders({
+              referer,
+              origin,
+              contentType: data ? 'application/x-www-form-urlencoded' : undefined,
+            });
+
       const response = await axios.request({
         method,
         url,
         data,
-        headers: buildHeaders({
-          referer,
-          origin,
-          contentType: data ? 'application/x-www-form-urlencoded' : undefined,
-        }),
+        headers,
         timeout: timeoutMs,
         responseType: 'text',
         maxRedirects: 5,
@@ -793,10 +847,16 @@ async function requestPage({
 
       const challengeCode = detectChallenge(html, engine);
       if (challengeCode && !hasOrganicMarkup(html, engine)) {
+        const jsRetryPage =
+          engine === 'google' &&
+          /\/httpservice\/retry\/enablejs|enablejs\?sei=/i.test(html);
+
         throw new ScraperError(
-          challengeCode === 'CONSENT'
-            ? `${provider} returned a consent page instead of results.`
-            : `${provider} returned a bot challenge page.`,
+          jsRetryPage
+            ? 'Google returned a JavaScript-only retry page instead of organic results.'
+            : challengeCode === 'CONSENT'
+              ? `${provider} returned a consent page instead of results.`
+              : `${provider} returned a bot challenge page.`,
           { code: challengeCode, status }
         );
       }
@@ -903,6 +963,7 @@ async function scanGoogle({
   query,
   targetDomain,
   maxPages,
+  targetResults,
   requestDelayMs,
   timeoutMs,
   retries,
@@ -952,10 +1013,15 @@ async function scanGoogle({
     if (organicCount === 0) {
       if (page === 1) {
         const jsOnlyPage = /httpservice\/retry\/enablejs|enablejs/i.test(html);
+        if (jsOnlyPage) {
+          throw new ScraperError(
+            'Google returned a JavaScript-only retry page instead of organic results.',
+            { code: 'CHALLENGE', status: 503 }
+          );
+        }
+
         throw new ScraperError(
-          jsOnlyPage
-            ? 'Google returned a JavaScript-only page instead of organic results.'
-            : 'Google returned no organic results for this keyword.',
+          'Google returned no organic results for this keyword.',
           { code: 'EMPTY_RESULTS', status: 200 }
         );
       }
@@ -979,6 +1045,9 @@ async function scanGoogle({
       }
     }
 
+    // We only need up to 30 organic links (three result pages).
+    if (resultsScanned >= targetResults) break;
+
     if (page >= maxPages) break;
 
     const hasNextPage =
@@ -986,18 +1055,6 @@ async function scanGoogle({
     if (!hasNextPage) break;
 
     referer = url;
-  }
-
-  const minimumExpected = Math.min(
-    maxPages * GOOGLE_RESULTS_PER_PAGE,
-    MIN_ORGANIC_RESULTS
-  );
-
-  if (maxPages >= 3 && resultsScanned < minimumExpected) {
-    throw new ScraperError(
-      `Google returned only ${resultsScanned} organic results (expected at least ${minimumExpected}).`,
-      { code: 'INSUFFICIENT_RESULTS', status: 200 }
-    );
   }
 
   return buildNotFoundResult({
@@ -1128,19 +1185,20 @@ async function scanDuckDuckGo({
 /**
  * Check where `domain` ranks for `keyword` in organic search results.
  *
- * Google is scanned first. If Google is blocked or returns a captcha/consent
- * page, the scan transparently falls back to DuckDuckGo.
+ * Google is the primary and authoritative source. DuckDuckGo is only used when
+ * `fallbackToDuckDuckGo` (or DUCKDUCKGO_FALLBACK) is explicitly enabled.
  *
  * @param {string} domain  Domain or URL, e.g. "example.com" or "https://www.example.com/path".
  * @param {string} keyword Search query.
  * @param {object} [options]
- * @param {number} [options.maxPages]                 Pages to scan (default: MAX_RESULT_PAGES or 5, ~30-50 results).
+ * @param {number} [options.maxPages]                 Hard cap on SERP pages (default: MAX_RESULT_PAGES or 5).
+ * @param {number} [options.targetResults]            Stop after this many organic links (default: TARGET_ORGANIC_RESULTS or 30).
  * @param {number} [options.requestDelayMs]           Delay between page requests in ms (default: REQUEST_DELAY_MS or 1000).
  * @param {number} [options.timeoutMs]                Per-request timeout in ms (default: REQUEST_TIMEOUT_MS or 15000).
  * @param {number} [options.retries]                  Retry attempts per page request (default: 1).
  * @param {boolean} [options.includeSubdomains]       Match subdomains too (default: true).
  * @param {'google'|'duckduckgo'} [options.engine]    Primary engine (default: SEARCH_ENGINE or google).
- * @param {boolean} [options.fallbackToDuckDuckGo]    Fall back to DDG when Google fails (default: true).
+ * @param {boolean} [options.fallbackToDuckDuckGo]    Opt in to DDG when Google fails (default: false).
  * @param {AbortSignal} [options.signal]              Optional abort signal.
  * @returns {Promise<object>} Ranking result. `found` is false when the domain is not in the scanned pages.
  */
@@ -1149,6 +1207,10 @@ async function checkKeywordRank(domain, keyword, options = {}) {
   const query = normalizeKeyword(keyword);
 
   const maxPages = toPositiveInt(options.maxPages, DEFAULTS.maxPages);
+  const targetResults = toPositiveInt(
+    options.targetResults,
+    DEFAULTS.targetResults
+  );
   const requestDelayMs = toNonNegativeInt(
     options.requestDelayMs,
     DEFAULTS.requestDelayMs
@@ -1182,6 +1244,7 @@ async function checkKeywordRank(domain, keyword, options = {}) {
         query,
         targetDomain,
         maxPages,
+        targetResults,
         requestDelayMs,
         timeoutMs,
         retries,
@@ -1231,11 +1294,14 @@ async function checkKeywordRank(domain, keyword, options = {}) {
     const providers = [
       ...new Set(attempts.map((attempt) => engineLabel(attempt.engine))),
     ].join(' and ');
+    const googleOnly = attempts.every((attempt) => attempt.engine === 'google');
 
     throw new ScraperError(
-      `${providers} could not return organic results right now ` +
-        '(captcha, consent, or a JavaScript-only response). ' +
-        'Wait about a minute, then try again.',
+      googleOnly
+        ? 'Google returned a JavaScript-only retry page, captcha, or consent ' +
+            'screen instead of organic results. Wait a few minutes, then try again.'
+        : `${providers} could not return organic results (captcha, consent, ` +
+            'or a JavaScript-only response). Wait a few minutes, then try again.',
       { code: 'CHALLENGE', status: 503, cause: lastAttempt?.error }
     );
   }
