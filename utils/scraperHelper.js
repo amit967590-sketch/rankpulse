@@ -22,7 +22,12 @@ const GOOGLE_ORIGIN = 'https://www.google.com';
 const GOOGLE_SEARCH_URL = 'https://www.google.com/search';
 const DUCKDUCKGO_SEARCH_URL = 'https://html.duckduckgo.com/html/';
 const DUCKDUCKGO_ORIGIN = 'https://html.duckduckgo.com';
-
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br'
+};
 // Google shows 10 organic results per HTML result page.
 const GOOGLE_RESULTS_PER_PAGE = 10;
 
