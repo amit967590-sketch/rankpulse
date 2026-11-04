@@ -778,6 +778,33 @@ function buildGoogleSearchUrl(query, start = 0) {
 }
 
 // ---------------------------------------------------------------------------
+// ScraperAPI proxy (optional)
+// ---------------------------------------------------------------------------
+
+const SCRAPER_API_ENDPOINT = 'http://api.scraperapi.com';
+
+// ScraperAPI solves Google's JS retry page in its own browser, which routinely
+// takes longer than a direct scrape, so proxied requests get extra headroom.
+const SCRAPER_API_MIN_TIMEOUT_MS = 60000;
+
+function getScraperApiKey() {
+  return String(process.env.SCRAPER_API_KEY || '').trim();
+}
+
+/**
+ * Wrap `targetUrl` in a ScraperAPI request. ScraperAPI fetches the URL from
+ * its own IPs (so datacenter blocks and the JavaScript retry page are handled
+ * upstream) and returns the same Google HTML. Returns null when no key is
+ * configured, which makes callers fall back to a direct request.
+ */
+function buildScraperApiUrl(targetUrl) {
+  const apiKey = getScraperApiKey();
+  if (!apiKey) return null;
+
+  return `${SCRAPER_API_ENDPOINT}?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}`;
+}
+
+// ---------------------------------------------------------------------------
 // HTTP layer
 // ---------------------------------------------------------------------------
 
@@ -793,27 +820,38 @@ async function requestPage({
   signal,
 }) {
   let lastError;
-  const provider = engineLabel(engine);
+  // Route Google through ScraperAPI when a key is configured; otherwise hit
+  // Google directly with BROWSER_HEADERS.
+  const scraperApiUrl = engine === 'google' ? buildScraperApiUrl(url) : null;
+  const viaScraperApi = Boolean(scraperApiUrl);
+  const provider = viaScraperApi ? 'ScraperAPI' : engineLabel(engine);
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      // Google gets BROWSER_HEADERS (buildGoogleHeaders spreads it and adds
-      // the referer); other engines get a rotated browser profile.
-      const headers =
-        engine === 'google'
-          ? buildGoogleHeaders({ referer })
-          : buildHeaders({
-              referer,
-              origin,
-              contentType: data ? 'application/x-www-form-urlencoded' : undefined,
-            });
+      // ScraperAPI supplies its own browser fingerprint and solves Google's JS
+      // retry page, so forwarded browser headers would only add noise. Direct
+      // Google requests get BROWSER_HEADERS; other engines a rotated profile.
+      let headers;
+      if (viaScraperApi) {
+        headers = {};
+      } else if (engine === 'google') {
+        headers = buildGoogleHeaders({ referer });
+      } else {
+        headers = buildHeaders({
+          referer,
+          origin,
+          contentType: data ? 'application/x-www-form-urlencoded' : undefined,
+        });
+      }
 
       const response = await axios.request({
-        method,
-        url,
-        data,
+        method: viaScraperApi ? 'GET' : method,
+        url: viaScraperApi ? scraperApiUrl : url,
+        data: viaScraperApi ? undefined : data,
         headers,
-        timeout: timeoutMs,
+        timeout: viaScraperApi
+          ? Math.max(timeoutMs, SCRAPER_API_MIN_TIMEOUT_MS)
+          : timeoutMs,
         responseType: 'text',
         maxRedirects: 5,
         signal,
@@ -823,6 +861,13 @@ async function requestPage({
       const html =
         typeof response.data === 'string' ? response.data : String(response.data ?? '');
       const status = response.status;
+
+      if (viaScraperApi && status === 401) {
+        throw new ScraperError(
+          'ScraperAPI rejected the request (HTTP 401) - check SCRAPER_API_KEY.',
+          { code: 'AUTH', status }
+        );
+      }
 
       if (status === 403 || status === 429) {
         throw new ScraperError(
