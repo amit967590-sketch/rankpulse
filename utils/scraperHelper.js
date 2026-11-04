@@ -70,8 +70,10 @@ const DEFAULTS = {
   timeoutMs: toPositiveInt(process.env.REQUEST_TIMEOUT_MS, 15000),
   retries: 1,
   engine: normalizeEngine(process.env.SEARCH_ENGINE || 'google'),
-  // Google is the source of truth. DuckDuckGo is now opt-in only.
-  fallbackToDuckDuckGo: toBoolean(process.env.DUCKDUCKGO_FALLBACK, false),
+  // Google is the primary source. When Google serves a challenge page or no
+  // result nodes, the scan falls back to DuckDuckGo automatically. Set
+  // DUCKDUCKGO_FALLBACK=false to disable the fallback.
+  fallbackToDuckDuckGo: toBoolean(process.env.DUCKDUCKGO_FALLBACK, true),
 };
 
 class ScraperError extends Error {
@@ -522,7 +524,9 @@ const GOOGLE_CHALLENGE_PATTERNS = [
   /our systems have detected/i,
   /please show you['’]re not a robot/i,
   /id=["']recaptcha["']/i,
-  /class=["'][^"']*g-recaptcha/i,
+  /g-recaptcha/i,
+  /recaptcha\/api\.js/i,
+  /verification challenge/i,
 ];
 
 /**
@@ -659,8 +663,8 @@ function parseResults($, page, startPosition, seenUrls = new Set()) {
   const results = [];
   let organicCount = 0;
 
-  let $containers = $('#links .result');
-  if ($containers.length === 0) $containers = $('.result');
+  let $containers = $('#links .result, #links .web-result');
+  if ($containers.length === 0) $containers = $('.result, .web-result');
 
   $containers.each((_, element) => {
     const $result = $(element);
@@ -674,7 +678,8 @@ function parseResults($, page, startPosition, seenUrls = new Set()) {
       return;
     }
 
-    const $anchor = $result.find('a.result__a').first();
+    let $anchor = $result.find('a.result__a').first();
+    if ($anchor.length === 0) $anchor = $result.find('h2 a[href]').first();
     if ($anchor.length === 0) return;
 
     let url = resolveResultUrl($anchor.attr('href'), 'duckduckgo');
@@ -1230,8 +1235,10 @@ async function scanDuckDuckGo({
 /**
  * Check where `domain` ranks for `keyword` in organic search results.
  *
- * Google is the primary and authoritative source. DuckDuckGo is only used when
- * `fallbackToDuckDuckGo` (or DUCKDUCKGO_FALLBACK) is explicitly enabled.
+ * Google is the primary source. If Google serves a verification challenge
+ * (captcha, "unusual traffic", g-recaptcha) or no result nodes at all, the
+ * check automatically retries the keyword on DuckDuckGo. Pass
+ * `fallbackToDuckDuckGo: false` (or DUCKDUCKGO_FALLBACK=false) to disable.
  *
  * @param {string} domain  Domain or URL, e.g. "example.com" or "https://www.example.com/path".
  * @param {string} keyword Search query.
@@ -1243,7 +1250,7 @@ async function scanDuckDuckGo({
  * @param {number} [options.retries]                  Retry attempts per page request (default: 1).
  * @param {boolean} [options.includeSubdomains]       Match subdomains too (default: true).
  * @param {'google'|'duckduckgo'} [options.engine]    Primary engine (default: SEARCH_ENGINE or google).
- * @param {boolean} [options.fallbackToDuckDuckGo]    Opt in to DDG when Google fails (default: false).
+ * @param {boolean} [options.fallbackToDuckDuckGo]    Fall back to DDG when Google is blocked or empty (default: true).
  * @param {AbortSignal} [options.signal]              Optional abort signal.
  * @returns {Promise<object>} Ranking result. `found` is false when the domain is not in the scanned pages.
  */
