@@ -56,7 +56,7 @@ POST /api/check-rank
 { "domain": "example.com", "keyword": "example keyword" }
 ```
 
-Success returns the same fields the frontend already reads: `success`, `found`, `position`, `page`, `url`, `title`, `snippet`, `resultsScanned`, `scannedResults`, `pagesChecked`, `checkedAt`.
+Success returns the same fields the frontend already reads: `success`, `found`, `position`, `page`, `providerPage`, `url`, `title`, `snippet`, `resultsScanned`, `scannedResults`, `pagesChecked`, `checkedAt`.
 
 ### Frontend configuration
 
@@ -77,8 +77,8 @@ That is why there is no `API_BASE_URL` constant to maintain. Same-origin also me
 
 | Variable | Code default | Required on Vercel? |
 | --- | --- | --- |
-| `MAX_RESULT_PAGES` | `10` | No. 10 pages ≈ 100 organic results. Hard cap 10. |
-| `TARGET_ORGANIC_RESULTS` | `100` | No. Stop after this many organic links. Cap 100. |
+| `MAX_RESULT_PAGES` | `10` | No. Full scan depth. Hard cap 10 pages. |
+| `TARGET_ORGANIC_RESULTS` | `150` | No. Stop after this many organic links (10 pages ≈ 100–150). Cap 150. |
 | `SCRAPER_RETRIES` | `1` | No. Retries per page after a transient block; `0`–`2`. |
 | `API_TIME_BUDGET_MS` | `280000` | No. Internal deadline; must stay below `maxDuration` (300s). |
 | `REQUEST_TIMEOUT_MS` | `15000` | No. Per-request timeout for direct DuckDuckGo scrapes. |
@@ -200,7 +200,7 @@ Open `https://<project>.vercel.app/api/health` (or `/health`). Expected:
   "runtime": "vercel",
   "engine": "duckduckgo",
   "maxPages": 10,
-  "targetResults": 100,
+  "targetResults": 150,
   "retries": 1,
   "proxyFallback": true,
   "timeBudgetMs": 280000,
@@ -259,7 +259,7 @@ Vercel Hobby is free and does not require a card for this setup:
 | Static requests | Served from the CDN within the Hobby allowance |
 | Cost | $0 |
 
-Each rank check is **one function invocation**. DuckDuckGo's HTML endpoint is free, and each scan requests up to `MAX_RESULT_PAGES` pages. A 10-page scan stops as soon as 100 organic links are read or the time budget runs out, so requests are not spent on pages that can no longer change the result.
+Each rank check is **one function invocation**. DuckDuckGo's HTML endpoint is free, and each scan requests all `MAX_RESULT_PAGES` pages (10 by default). The scan stops early only when the target domain is found, when the provider runs out of results, when it repeats a page, when the time budget runs out, or at the `TARGET_ORGANIC_RESULTS` safety cap (150, above what ten pages can return).
 
 Vercel's datacenter IPs are sometimes blocked by DuckDuckGo outright. With `DDG_PROXY_FALLBACK=true` (the default) the scraper retries a blocked request through the free [Jina Reader](https://r.jina.ai/) service, which returns the same DuckDuckGo HTML from its own IPs. It needs no API key and is used only after a direct request fails; the rest of that scan then stays on the proxy.
 

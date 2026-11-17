@@ -32,12 +32,19 @@ const JINA_READER_URL = 'https://r.jina.ai/';
 const JINA_MIN_TIMEOUT_MS = 30000;
 const PROXY_PAGE_DELAY_MS = 3000;
 
-// DuckDuckGo's HTML endpoint serves roughly ten organic results per page.
+// DuckDuckGo's HTML endpoint serves roughly ten organic results on the first
+// page and up to fifteen on later pages.
 const DUCKDUCKGO_RESULTS_PER_PAGE = 10;
 
-// Collect up to 100 organic links (ten result pages) per check. The scan stops
-// early as soon as the target domain is matched.
-const TARGET_ORGANIC_RESULTS = 100;
+// Positions are reported in the conventional 10-results-per-page layout, so
+// "page 2" always means positions 11–20 regardless of how many links DDG puts
+// on one of its own pages.
+const CONVENTIONAL_RESULTS_PER_PAGE = 10;
+
+// Collect every organic link from the full ten-page scan (~100–150 links
+// depending on how many DDG returns per page). The scan still stops as soon as
+// the target domain is matched.
+const TARGET_ORGANIC_RESULTS = 150;
 
 // A paged scan stops when less than this much time is left, so an in-flight
 // request can still finish and the caller receives partial results instead of
@@ -446,8 +453,12 @@ function hasOrganicMarkup(html) {
  * Organic result positions are tracked across pages (1, 2, 3, ...).
  * Sponsored results are ignored and do not consume a position.
  *
+ * The returned `page` is the conventional 10-results-per-page page number
+ * (position 22 -> page 3), so positions line up with how SEO tools and Google
+ * report them. The provider's own page number is kept as `providerPage`.
+ *
  * @param {import('cheerio').CheerioAPI} $
- * @param {number} page            1-based DuckDuckGo result page number.
+ * @param {number} page            Provider page number (1-based).
  * @param {number} startPosition   Position of the first result on this page.
  * @param {Set<string>} seenUrls   URLs already collected on previous pages.
  * @returns {{ results: Array<object>, organicCount: number }}
@@ -456,15 +467,25 @@ function parseResults($, page, startPosition, seenUrls = new Set()) {
   const results = [];
   let organicCount = 0;
 
-  let $containers = $('#links .result, #links .web-result');
-  if ($containers.length === 0) $containers = $('.result, .web-result');
+  // DDG has used several result containers over time. Match all known variants
+  // (a comma selector de-duplicates nodes) so a markup change on one page does
+  // not silently drop that page's results.
+  let $containers = $(
+    '#links .result, #links .web-result, #links article.result, #links li.result'
+  );
+  if ($containers.length === 0) {
+    $containers = $(
+      '.result, .web-result, article[data-testid="result"], article.result'
+    );
+  }
 
   $containers.each((_, element) => {
     const $result = $(element);
 
-    // Ads / sponsored placements are not organic rankings.
+    // Ads, empty placeholders, and "no result" blocks are not organic rankings.
     if (
       $result.hasClass('result--ad') ||
+      $result.hasClass('result--no-result') ||
       $result.find('.result--ad').length > 0 ||
       $result.find('.result__badge').length > 0
     ) {
@@ -498,7 +519,8 @@ function parseResults($, page, startPosition, seenUrls = new Set()) {
 
     results.push({
       position,
-      page,
+      page: Math.floor((position - 1) / CONVENTIONAL_RESULTS_PER_PAGE) + 1,
+      providerPage: page,
       title,
       url,
       domain: hostname,
@@ -515,7 +537,7 @@ function parseResults($, page, startPosition, seenUrls = new Set()) {
  * DuckDuckGo exposes the result offset in a hidden `s` input.
  */
 function extractNextPageForm($) {
-  const forms = $('.nav-link form').toArray();
+  const forms = $('.nav-link form, #links form, form.js-result-form').toArray();
 
   for (const form of forms) {
     const $form = $(form);
@@ -592,11 +614,18 @@ function extractDuckDuckGoVqd($, html) {
 }
 
 /**
- * Work out the result offset for the next DuckDuckGo page. The hidden `s` field
- * of the next-page form is authoritative; otherwise fall back to the number of
- * organic results parsed so far.
+ * Work out the result offset for the next DuckDuckGo page.
+ *
+ * The hidden `s` field of the next-page form is authoritative. Some responses
+ * omit that form even though more results exist, so fall back to advancing by
+ * the number of organic results actually seen on this page (or DDG's first-page
+ * size, whichever is larger) instead of ending the scan.
  */
-function resolveDuckDuckGoNextOffset($, currentOffset, resultsScanned) {
+function resolveDuckDuckGoNextOffset(
+  $,
+  currentOffset,
+  currentPageOrganicCount = 0
+) {
   const nextForm = extractNextPageForm($);
   const formOffset = Number(nextForm?.fields?.s);
 
@@ -604,9 +633,9 @@ function resolveDuckDuckGoNextOffset($, currentOffset, resultsScanned) {
     return formOffset;
   }
 
-  return Math.max(
-    currentOffset + DUCKDUCKGO_RESULTS_PER_PAGE,
-    resultsScanned
+  return (
+    currentOffset +
+    Math.max(currentPageOrganicCount, DUCKDUCKGO_RESULTS_PER_PAGE)
   );
 }
 
@@ -827,6 +856,7 @@ function buildFoundResult({
     engine: 'duckduckgo',
     position: result.position,
     page: result.page,
+    providerPage: result.providerPage,
     url: result.url,
     title: result.title,
     snippet: result.snippet,
@@ -876,7 +906,9 @@ function buildNotFoundResult({
           ? ' The scan stopped early to stay inside the request time limit.'
           : partialReason === 'PAGINATION_UNAVAILABLE'
             ? ' The scan stopped early because the search provider did not return a pagination token.'
-            : ' The scan stopped early because the search provider started rate-limiting requests.'
+            : partialReason === 'PAGINATION_REPEATED'
+              ? ' The scan stopped early because the search provider repeated the same results instead of paging.'
+              : ' The scan stopped early because the search provider started rate-limiting requests.'
         : ''),
   };
 }
@@ -1027,6 +1059,14 @@ async function scanDuckDuckGo({
       break;
     }
 
+    // A later page that returns only URLs we have already seen means the
+    // provider ignored the offset and served an earlier page again. Stop here
+    // instead of inflating positions with duplicate results.
+    if (page > 1 && results.length === 0) {
+      partialReason = 'PAGINATION_REPEATED';
+      break;
+    }
+
     resultsScanned += organicCount;
     startPosition = resultsScanned + 1;
 
@@ -1043,22 +1083,28 @@ async function scanDuckDuckGo({
       }
     }
 
-    // Stop as soon as enough organic links were read, or when the page cap is
+    // Stop once enough organic links were read, or when the page cap is
     // reached. This bounds the number of outbound requests per check.
     if (resultsScanned >= targetResults) break;
     if (page >= maxPages) break;
 
-    // No next-page form means DuckDuckGo has no further results to serve.
-    if (!extractNextPageForm($)) break;
-
-    // DuckDuckGo ignores the offset without the per-query `vqd` token and would
-    // serve page 1 again, so a missing token ends the deep scan.
+    // Keep paging even when the "Next" form is missing: DDG occasionally omits
+    // it while still serving later pages. The offset helper falls back to the
+    // current page's result count.
     if (!vqd) {
       partialReason = 'PAGINATION_UNAVAILABLE';
       break;
     }
 
-    offset = resolveDuckDuckGoNextOffset($, offset, resultsScanned);
+    const nextOffset = resolveDuckDuckGoNextOffset($, offset, organicCount);
+
+    // An offset that does not move forward would request the same page again.
+    if (!Number.isFinite(nextOffset) || nextOffset <= offset) {
+      partialReason = 'PAGINATION_UNAVAILABLE';
+      break;
+    }
+
+    offset = nextOffset;
     referer = pageUrl;
   }
 

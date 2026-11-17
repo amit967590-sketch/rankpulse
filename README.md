@@ -6,7 +6,7 @@ A small Node.js/Express app that checks where a domain ranks in DuckDuckGo searc
 
 - **Free rank checks** against live DuckDuckGo organic results, with no API key
 - **Direct HTML scraping** via `axios` + `cheerio`; no paid scraping provider
-- **Deep SERP scans** — 10 pages by default (~100 organic results, configurable up to 10 pages), so lower-ranking domains are still found
+- **Deep SERP scans** — the full 10 pages by default (~100–150 organic results), so lower-ranking domains on page 2 or 3 are not missed
 - **Position and page** for the matched result (or a clear “not found” state with scan counts)
 - **Respectful request handling** — randomized browser headers, user-agent rotation, and jittered pacing between pages
 - **Polished dark UI** with responsive layouts, loading states, result cards, and error toasts
@@ -69,13 +69,13 @@ When the domain is not found, the endpoint still returns `200` with a clear mess
   "found": false,
   "engine": "duckduckgo",
   "position": null,
-  "resultsScanned": 100,
+  "resultsScanned": 145,
   "pagesChecked": 10,
-  "message": "No match found for \"example.com\" after scanning 100 organic results across 10 pages on DuckDuckGo."
+  "message": "No match found for \"example.com\" after scanning 145 organic results across 10 pages on DuckDuckGo."
 }
 ```
 
-`resultsScanned` is the number of organic results actually parsed. `pagesChecked` is the number of SERP pages actually fetched. `scannedResults` is retained as a backwards-compatible alias.
+`resultsScanned` is the number of organic results actually parsed. `pagesChecked` is the number of SERP pages actually fetched. `scannedResults` is retained as a backwards-compatible alias. `position` is the organic ranking position, and `page` is the conventional 10-results-per-page page number (position 22 is page 3), so positions are comparable between tools. `providerPage` is DuckDuckGo's own page number, which can differ because later DDG pages return ~15 results.
 
 Error responses use a stable shape:
 
@@ -111,8 +111,8 @@ Settings live in `.env` (see `.env.example`):
 | `ALLOWED_ORIGINS`    | empty    | Comma-separated CORS allow-list (empty = any)       |
 | `RATE_LIMIT_WINDOW_MS` | `900000` | Rate-limit window in milliseconds                 |
 | `RATE_LIMIT_MAX`     | `100`    | Requests allowed per window per IP                  |
-| `MAX_RESULT_PAGES`   | `10`     | Pages to scan (10 ≈ 100 results, max 10)            |
-| `TARGET_ORGANIC_RESULTS` | `100` | Stop after this many organic links (max 100)      |
+| `MAX_RESULT_PAGES`   | `10`     | Full scan depth (10 pages, max 10)                  |
+| `TARGET_ORGANIC_RESULTS` | `150` | Stop after this many organic links (max 150)      |
 | `REQUEST_DELAY_MS`   | `1200`   | Delay between pages in milliseconds                 |
 | `REQUEST_TIMEOUT_MS` | `15000`  | Outbound request timeout                            |
 | `DDG_PROXY_FALLBACK` | `true`   | Retry blocked direct requests via free Jina Reader  |

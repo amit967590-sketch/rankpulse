@@ -26,28 +26,41 @@ function resultBlock(index) {
   ].join('');
 }
 
-function pageHtml({ offset, nextOffset, startIndex, count, vqd, duplicateOf }) {
+function pageHtml({
+  offset,
+  formOffset,
+  startIndex,
+  count,
+  vqd,
+  duplicateOf,
+  repeatOfPageOne,
+}) {
   const blocks = [];
   for (let i = 0; i < count; i += 1) {
     blocks.push(resultBlock(startIndex + i));
   }
   if (duplicateOf) blocks.push(resultBlock(duplicateOf));
+  if (repeatOfPageOne) blocks.push(resultBlock(1));
 
   const form =
-    nextOffset !== null
+    formOffset !== null
       ? [
           '<div class="nav-link"><form action="/html/" method="post">',
           '<input type="submit" value="Next">',
-          `<input type="hidden" name="s" value="${nextOffset}">`,
+          `<input type="hidden" name="s" value="${formOffset}">`,
           `<input type="hidden" name="vqd" value="${vqd}">`,
           '<input type="hidden" name="q" value="test query">',
           '</form></div>',
         ].join('')
       : '';
 
+  // Real DDG pages also expose the token in links/scripts, which is what keeps
+  // pagination possible when the "Next" form itself is absent.
+  const tokenLink = `<a href="/html/?q=test+query&vqd=${vqd}" class="vqd-token"></a>`;
+
   return `<!DOCTYPE html><html><body><h1>offset ${offset}</h1><div id="links">${blocks.join(
     ''
-  )}</div>${form}</body></html>`;
+  )}</div>${form}${tokenLink}</body></html>`;
 }
 
 const requests = [];
@@ -103,6 +116,7 @@ function report(name, result) {
     JSON.stringify({
       found: result.found,
       page: result.page,
+      providerPage: result.providerPage,
       position: result.position,
       resultsScanned: result.resultsScanned,
       pagesChecked: result.pagesChecked,
@@ -124,22 +138,53 @@ function assert(name, condition, detail) {
   }
 }
 
-function fixture({ pageCount = 5, nextOffsetFor, count = 10 } = {}) {
+/**
+ * Build a fixture with a configurable result count per page.
+ *
+ * `omitFormPages` hides DDG's "Next" form on those pages while still serving
+ * later pages, which exercises the offset fallback.
+ */
+function fixture({
+  pageCount = 5,
+  page1Count = 10,
+  perPage = 10,
+  omitFormPages = [],
+  repeatPageOne = false,
+  vqd = '4-test-token',
+} = {}) {
+  const offsets = [0];
+  let total = page1Count;
+  for (let page = 2; page <= pageCount; page += 1) {
+    offsets.push(total);
+    total += perPage;
+  }
+
   return ({ offset }) => {
-    const page = offset / 10 + 1;
-    const nextOffset =
-      typeof nextOffsetFor === 'function'
-        ? nextOffsetFor(page, pageCount)
-        : page < pageCount
-          ? page * 10
-          : null;
+    let index = offsets.indexOf(offset);
+    const page = index >= 0 ? index + 1 : Math.floor(offset / perPage) + 1;
+
+    if (repeatPageOne) {
+      return pageHtml({
+        offset,
+        formOffset: 10,
+        startIndex: 1,
+        count: page1Count,
+        vqd,
+      });
+    }
+
+    const startIndex =
+      page === 1 ? 1 : page1Count + (page - 2) * perPage + 1;
+    const count = page === 1 ? page1Count : perPage;
+    const nextOffset = page < pageCount ? offsets[page] : null;
+    const showForm = !omitFormPages.includes(page);
 
     return pageHtml({
       offset,
-      nextOffset,
-      startIndex: (page - 1) * 10 + 1,
+      formOffset: showForm ? nextOffset : null,
+      startIndex,
       count,
-      vqd: '4-test-token',
+      vqd,
     });
   };
 }
@@ -151,7 +196,7 @@ function fixture({ pageCount = 5, nextOffsetFor, count = 10 } = {}) {
 
   let result = await checkKeywordRank('site22.example', 'test query', {
     maxPages: 10,
-    targetResults: 100,
+    targetResults: 150,
     retries: 0,
   });
   report('page 3 match', result);
@@ -176,7 +221,7 @@ function fixture({ pageCount = 5, nextOffsetFor, count = 10 } = {}) {
     const page = offset / 10 + 1;
     return pageHtml({
       offset,
-      nextOffset: page < 2 ? 10 : null,
+      formOffset: page < 2 ? 10 : null,
       startIndex: (page - 1) * 10 + 1,
       count: 10,
       vqd: '4-dup',
@@ -186,7 +231,7 @@ function fixture({ pageCount = 5, nextOffsetFor, count = 10 } = {}) {
 
   result = await checkKeywordRank('site12.example', 'test query', {
     maxPages: 10,
-    targetResults: 100,
+    targetResults: 150,
     retries: 0,
   });
   report('duplicate page', result);
@@ -199,7 +244,7 @@ function fixture({ pageCount = 5, nextOffsetFor, count = 10 } = {}) {
 
   result = await checkKeywordRank('site99.example', 'test query', {
     maxPages: 10,
-    targetResults: 100,
+    targetResults: 150,
     retries: 0,
   });
   report('rate limit on page 2', result);
@@ -211,27 +256,84 @@ function fixture({ pageCount = 5, nextOffsetFor, count = 10 } = {}) {
     result.message
   );
 
-  // 4. Ten full pages stop exactly at the 100-result target.
+  // 4. The default depth scans all ten pages when the result cap allows it.
   reset();
   htmlForOffset = fixture({ pageCount: 10 });
 
   result = await checkKeywordRank('missing.example', 'test query', {
     maxPages: 10,
-    targetResults: 100,
+    targetResults: 150,
     retries: 0,
   });
   report('ten pages', result);
   assert('ten pages checked', result.pagesChecked === 10, result.pagesChecked);
   assert('100 results scanned', result.resultsScanned === 100);
-  assert('no extra request past target', requests.length === 10, requests.length);
+  assert('ten requests made', requests.length === 10, requests.length);
+  assert(
+    'offset advances through every page',
+    JSON.stringify(requests.map((request) => request.offset)) ===
+      '[0,10,20,30,40,50,60,70,80,90]',
+    JSON.stringify(requests.map((request) => request.offset))
+  );
 
-  // 5. Soft deadline returns partial results instead of throwing.
+  // 5. Missing "Next" forms no longer stop the scan before later pages.
+  reset();
+  htmlForOffset = fixture({ pageCount: 5, omitFormPages: [1, 2] });
+
+  result = await checkKeywordRank('site22.example', 'test query', {
+    maxPages: 10,
+    targetResults: 150,
+    retries: 0,
+  });
+  report('missing next form', result);
+  assert('missing form still finds page 3', result.found && result.page === 3);
+  assert('missing form position 22', result.position === 22, result.position);
+  assert(
+    'fallback offsets advance by page size',
+    JSON.stringify(requests.map((request) => request.offset)) === '[0,10,20]',
+    JSON.stringify(requests.map((request) => request.offset))
+  );
+
+  // 6. A provider that ignores the offset (serving page 1 again) is detected
+  //    instead of inflating positions with duplicates.
+  reset();
+  htmlForOffset = fixture({ pageCount: 10, repeatPageOne: true });
+
+  result = await checkKeywordRank('missing.example', 'test query', {
+    maxPages: 10,
+    targetResults: 150,
+    retries: 0,
+  });
+  report('repeated page', result);
+  assert('repeated page stops after two requests', requests.length === 2, requests.length);
+  assert('repeated page does not inflate results', result.resultsScanned === 10);
+  assert(
+    'repeated page message',
+    /repeated the same results/.test(result.message || ''),
+    result.message
+  );
+
+  // 7. Page numbers are conventional (10 results/page), not DDG's own pages.
+  reset();
+  htmlForOffset = fixture({ pageCount: 3, page1Count: 15, perPage: 15 });
+
+  result = await checkKeywordRank('site21.example', 'test query', {
+    maxPages: 10,
+    targetResults: 150,
+    retries: 0,
+  });
+  report('conventional page mapping', result);
+  assert('position 21', result.position === 21, result.position);
+  assert('provider page 2', result.providerPage === 2, result.providerPage);
+  assert('reported as page 3', result.page === 3, result.page);
+
+  // 8. Soft deadline returns partial results instead of throwing.
   reset();
   htmlForOffset = fixture({ pageCount: 10 });
 
   result = await checkKeywordRank('missing.example', 'test query', {
     maxPages: 10,
-    targetResults: 100,
+    targetResults: 150,
     retries: 0,
     timeBudgetMs: 1,
   });
@@ -243,13 +345,13 @@ function fixture({ pageCount = 5, nextOffsetFor, count = 10 } = {}) {
     result.message
   );
 
-  // 6. A first-page challenge is reported as unavailable, not "not found".
+  // 9. A first-page challenge is reported as unavailable, not "not found".
   reset();
   challengeAll = true;
 
   result = await checkKeywordRank('missing.example', 'test query', {
     maxPages: 10,
-    targetResults: 100,
+    targetResults: 150,
     retries: 0,
   });
   report('first-page challenge', result);
@@ -257,14 +359,14 @@ function fixture({ pageCount = 5, nextOffsetFor, count = 10 } = {}) {
   assert('challenge code', result.code === 'CHALLENGE', result.code);
   assert('challenge is marked blocked', result.blocked === true);
 
-  // 7. A blocked direct request falls back to the free proxy for the whole scan.
+  // 10. A blocked direct request falls back to the free proxy for the whole scan.
   reset();
   directBlocked = true;
   htmlForOffset = fixture({ pageCount: 3 });
 
   result = await checkKeywordRank('site15.example', 'test query', {
     maxPages: 3,
-    targetResults: 100,
+    targetResults: 150,
     retries: 0,
     requestDelayMs: 0,
     proxyFallback: true,
