@@ -50,6 +50,7 @@ Successful response:
   "engine": "duckduckgo",
   "position": 7,
   "page": 1,
+  "providerPage": 1,
   "url": "https://expressjs.com/",
   "title": "Express.js · Node.js web application framework",
   "snippet": "Fast, unopinionated, minimalist web framework for Node.js",
