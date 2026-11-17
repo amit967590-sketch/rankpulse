@@ -26,9 +26,9 @@ const DUCKDUCKGO_ORIGIN = 'https://html.duckduckgo.com';
 // Google shows 10 organic results per HTML result page.
 const GOOGLE_RESULTS_PER_PAGE = 10;
 
-// Collect up to 30 organic links (three Google result pages) per check. The
+// Collect up to 100 organic links (ten Google result pages) per check. The
 // scan stops early as soon as the target domain is matched.
-const TARGET_ORGANIC_RESULTS = 30;
+const TARGET_ORGANIC_RESULTS = 100;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -61,7 +61,7 @@ function engineLabel(engine) {
 }
 
 const DEFAULTS = {
-  maxPages: toPositiveInt(process.env.MAX_RESULT_PAGES, 5),
+  maxPages: toPositiveInt(process.env.MAX_RESULT_PAGES, 10),
   targetResults: toPositiveInt(
     process.env.TARGET_ORGANIC_RESULTS,
     TARGET_ORGANIC_RESULTS
@@ -796,6 +796,10 @@ const SCRAPER_API_GOOGLE_PARAMS = 'country_code=in&render=true';
 // takes longer than a direct scrape, so proxied requests get extra headroom.
 const SCRAPER_API_MIN_TIMEOUT_MS = 60000;
 
+// Rendered ScraperAPI fetches are slow and bill credits, so paging through
+// them is spaced further apart than direct requests to stay clear of limits.
+const SCRAPER_API_PAGE_DELAY_MS = 3000;
+
 function getScraperApiKey() {
   return String(process.env.SCRAPER_API_KEY || '').trim();
 }
@@ -986,6 +990,7 @@ function buildNotFoundResult({
   resultsScanned,
   pagesChecked,
   checkedAt,
+  partialReason,
 }) {
   const resultWord = resultsScanned === 1 ? 'result' : 'results';
   const pageWord = pagesChecked === 1 ? 'page' : 'pages';
@@ -1009,7 +1014,10 @@ function buildNotFoundResult({
     message:
       `No match found for "${targetDomain}" after scanning ` +
       `${resultsScanned} organic ${resultWord} across ${pagesChecked} ` +
-      `${pageWord} on ${engineLabel(engine)}.`,
+      `${pageWord} on ${engineLabel(engine)}.` +
+      (partialReason
+        ? ' The scan stopped early because the search provider started rate-limiting requests.'
+        : ''),
   };
 }
 
@@ -1078,6 +1086,7 @@ async function scanGoogle({
   let pagesChecked = 0;
   let startPosition = 1;
   let referer;
+  let partialReason;
 
   for (let page = 1; page <= maxPages; page += 1) {
     if (page > 1) {
@@ -1090,17 +1099,27 @@ async function scanGoogle({
       (page - 1) * GOOGLE_RESULTS_PER_PAGE
     );
 
-    const html = await requestPage({
-      engine: 'google',
-      method: 'GET',
-      url,
-      data: undefined,
-      referer,
-      origin: page > 1 ? GOOGLE_ORIGIN : undefined,
-      timeoutMs,
-      retries,
-      signal,
-    });
+    let html;
+    try {
+      html = await requestPage({
+        engine: 'google',
+        method: 'GET',
+        url,
+        data: undefined,
+        referer,
+        origin: page > 1 ? GOOGLE_ORIGIN : undefined,
+        timeoutMs,
+        retries,
+        signal,
+      });
+    } catch (error) {
+      // Page 1 failing means Google is unusable right now, so let the caller
+      // try the fallback engine. Once earlier pages are already scanned, a
+      // rate limit should only end the deep scan: keep the work done so far.
+      if (page === 1) throw error;
+      partialReason = error.code || 'REQUEST_FAILED';
+      break;
+    }
 
     pagesChecked = page;
 
@@ -1166,6 +1185,7 @@ async function scanGoogle({
     resultsScanned,
     pagesChecked,
     checkedAt,
+    partialReason,
   });
 }
 
@@ -1300,9 +1320,9 @@ async function scanDuckDuckGo({
  * @param {string} domain  Domain or URL, e.g. "example.com" or "https://www.example.com/path".
  * @param {string} keyword Search query.
  * @param {object} [options]
- * @param {number} [options.maxPages]                 Hard cap on SERP pages (default: MAX_RESULT_PAGES or 5).
- * @param {number} [options.targetResults]            Stop after this many organic links (default: TARGET_ORGANIC_RESULTS or 30).
- * @param {number} [options.requestDelayMs]           Delay between page requests in ms (default: REQUEST_DELAY_MS or 1000).
+ * @param {number} [options.maxPages]                 Hard cap on SERP pages (default: MAX_RESULT_PAGES or 10).
+ * @param {number} [options.targetResults]            Stop after this many organic links (default: TARGET_ORGANIC_RESULTS or 100).
+ * @param {number} [options.requestDelayMs]           Delay between page requests in ms (default: REQUEST_DELAY_MS or 1000, raised to 3000 while paging through ScraperAPI).
  * @param {number} [options.timeoutMs]                Per-request timeout in ms (default: REQUEST_TIMEOUT_MS or 15000).
  * @param {number} [options.retries]                  Retry attempts per page request (default: 1).
  * @param {boolean} [options.includeSubdomains]       Match subdomains too (default: true).
@@ -1365,9 +1385,14 @@ async function runKeywordCheck(domain, keyword, options = {}) {
     options.targetResults,
     DEFAULTS.targetResults
   );
+  // Rendered ScraperAPI pages are slow and bill credits, so deep scans space
+  // them out further. An explicit caller delay still wins.
+  const defaultPageDelayMs = getScraperApiKey()
+    ? Math.max(DEFAULTS.requestDelayMs, SCRAPER_API_PAGE_DELAY_MS)
+    : DEFAULTS.requestDelayMs;
   const requestDelayMs = toNonNegativeInt(
     options.requestDelayMs,
-    DEFAULTS.requestDelayMs
+    defaultPageDelayMs
   );
   const timeoutMs = toPositiveInt(options.timeoutMs, DEFAULTS.timeoutMs);
   const retries = toNonNegativeInt(options.retries, DEFAULTS.retries);

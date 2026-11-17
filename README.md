@@ -114,14 +114,17 @@ Settings live in `.env` (see `.env.example`):
 | `RATE_LIMIT_MAX`     | `100`    | Requests allowed per window per IP                  |
 | `SEARCH_ENGINE`      | `google` | Primary engine: `google` or `duckduckgo`            |
 | `DUCKDUCKGO_FALLBACK`| `true`   | Fall back to DDG when Google is blocked/unavailable |
-| `MAX_RESULT_PAGES`   | `5`      | Pages to scan (5 ≈ 50 results, max 10)              |
-| `REQUEST_DELAY_MS`   | `1000`   | Delay between paginated requests                    |
+| `MAX_RESULT_PAGES`   | `10`     | Pages to scan (10 ≈ 100 results, max 10)            |
+| `REQUEST_DELAY_MS`   | `1000`   | Delay between pages (3s minimum via ScraperAPI)     |
 | `REQUEST_TIMEOUT_MS` | `15000`  | Outbound request timeout                            |
 
 ## Project structure
 
 ```
-server.js               Express app, API routes, static hosting
+server.js               Express app for local development and traditional hosts
+api/check-rank.js       Vercel Function for POST /api/check-rank
+api/health.js           Vercel Function for GET /api/health
+lib/                    Shared serverless helpers (config, CORS, rate limit, handler)
 utils/scraperHelper.js  Google/DuckDuckGo scraping, parsing, and matching
 public/index.html       Frontend markup and SEO metadata
 public/styles.css       Dark responsive design system
@@ -131,6 +134,8 @@ public/og-image.png     1200×630 social preview image
 
 ## Deployment notes
 
+- **Vercel (free):** see [`VERCEL.md`](VERCEL.md). The API runs as Serverless Functions in `api/`, the UI is served from `public/`, and `vercel.json` handles routing. No build step is required; add `SCRAPER_API_KEY` in the Vercel dashboard.
+- **Cloudflare Pages (static only):** see [`DEPLOY_CLOUDFLARE.md`](DEPLOY_CLOUDFLARE.md). Static hosting alone cannot run the rank-check API.
 - Before deploying, replace the relative `og:image` and `twitter:image` paths with absolute production URLs (for example `https://your-domain.com/og-image.png`) so social crawlers can fetch the card reliably.
 - Add the production domain to `ALLOWED_ORIGINS` if the API is called cross-origin.
 - Serve the app over HTTPS, then add an absolute `<link rel="canonical">` once the production domain is known.

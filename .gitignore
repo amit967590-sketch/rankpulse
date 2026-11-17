@@ -21,6 +21,12 @@ coverage/
 dist/
 build/
 
+# Cloudflare Wrangler local state
+.wrangler/
+
+# Deployment artifacts
+rankpulse-site.zip
+
 # OS / editor files
 .DS_Store
 Thumbs.db

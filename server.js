@@ -13,9 +13,9 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 // Deep-scan configuration: each Google/DuckDuckGo HTML page returns roughly
-// 10 organic results, so the 5-page default covers ~50 positions. The limit is
-// capped at 10 pages (~100 results) for deeper scans.
-const DEFAULT_MAX_RESULT_PAGES = 5;
+// 10 organic results, so the 10-page default covers ~100 positions. Deeper
+// scans are not allowed because ScraperAPI credits and latency grow per page.
+const DEFAULT_MAX_RESULT_PAGES = 10;
 const MAX_RESULT_PAGES_LIMIT = 10;
 const configuredMaxResultPages = Number(process.env.MAX_RESULT_PAGES);
 const MAX_RESULT_PAGES =

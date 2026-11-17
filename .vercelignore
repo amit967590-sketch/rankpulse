@@ -1,0 +1,13 @@
+# Files Vercel does not need to upload.
+# The deployed site is built from public/ + api/ + lib/ + utils/.
+_verify_depth.js
+rankpulse-site.zip
+deploy.ps1
+wrangler.jsonc
+DEPLOY_CLOUDFLARE.md
+VERCEL.md
+.env
+.env.local
+.env.*.local
+.env.example
+.wrangler/

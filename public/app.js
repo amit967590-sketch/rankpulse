@@ -291,6 +291,14 @@
       };
     }
 
+    if (error.status === 504 || error.code === 'REQUEST_TIMEOUT') {
+      return {
+        title: 'Check timed out',
+        message:
+          'The scan took too long to finish. Try again in a moment, or use a shorter keyword.',
+      };
+    }
+
     if (
       error.code === 'HTTP_ERROR' ||
       error.code === 'REQUEST_FAILED' ||
