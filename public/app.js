@@ -137,9 +137,7 @@
   }
 
   function engineName(value) {
-    if (value === 'duckduckgo') return 'DuckDuckGo';
-    if (value === 'google') return 'Google';
-    return 'Google';
+    return 'DuckDuckGo';
   }
 
   /* ------------------------------------------------------------------------
@@ -299,15 +297,6 @@
       };
     }
 
-    if (error.code === 'NO_CREDITS') {
-      return {
-        title: 'Scan credits exhausted',
-        message:
-          error.message ||
-          'The scraping service has no credits left for this billing cycle. Try again after the plan resets.',
-      };
-    }
-
     if (
       error.code === 'HTTP_ERROR' ||
       error.code === 'REQUEST_FAILED' ||
@@ -319,7 +308,7 @@
       return {
         title: 'Search provider unavailable',
         message:
-          'Google and DuckDuckGo did not respond as expected. Please try again in a moment.',
+          'DuckDuckGo did not respond as expected. Please try again in a moment.',
       };
     }
 

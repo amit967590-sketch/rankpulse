@@ -3,12 +3,15 @@
 /**
  * utils/scraperHelper.js
  *
- * SERP scraper for the SEO Keyword Rank Checker.
+ * Free SERP scraper for the SEO Keyword Rank Checker.
  *
- * Google is the primary engine. The scraper reads Google's public results
- * markup, follows `start` pagination, and counts organic results across pages.
- * If Google serves a captcha/consent page or the request fails, it automatically
- * falls back to DuckDuckGo's lightweight HTML endpoint.
+ * Results are fetched directly from DuckDuckGo's HTML endpoint with axios and
+ * parsed with cheerio. No API keys or paid providers are required.
+ *
+ * Pagination works by following the `s` offset of DuckDuckGo's own "Next" form
+ * and carrying the per-query `vqd` token forward. Without that token DuckDuckGo
+ * ignores the offset and serves page 1 again, so the token is required for any
+ * page after the first.
  *
  * Usage:
  *   const { checkKeywordRank } = require('./utils/scraperHelper');
@@ -18,20 +21,23 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 
-const GOOGLE_ORIGIN = 'https://www.google.com';
-const GOOGLE_SEARCH_URL = 'https://www.google.com/search';
 const DUCKDUCKGO_SEARCH_URL = 'https://html.duckduckgo.com/html/';
 const DUCKDUCKGO_ORIGIN = 'https://html.duckduckgo.com';
 
-// Google shows 10 organic results per HTML result page.
-const GOOGLE_RESULTS_PER_PAGE = 10;
+// Some hosts (notably Vercel's datacenter IPs) are blocked by DuckDuckGo. The
+// free Jina Reader service fetches the same DuckDuckGo HTML from its own IPs and
+// returns it unchanged when asked for HTML, so the same parser and pagination
+// keep working. No API key is required.
+const JINA_READER_URL = 'https://r.jina.ai/';
+const JINA_MIN_TIMEOUT_MS = 30000;
+const PROXY_PAGE_DELAY_MS = 3000;
+
+// DuckDuckGo's HTML endpoint serves roughly ten organic results per page.
+const DUCKDUCKGO_RESULTS_PER_PAGE = 10;
 
 // Collect up to 100 organic links (ten result pages) per check. The scan stops
 // early as soon as the target domain is matched.
 const TARGET_ORGANIC_RESULTS = 100;
-
-// Both engines show roughly ten organic results per HTML page.
-const DUCKDUCKGO_RESULTS_PER_PAGE = 10;
 
 // A paged scan stops when less than this much time is left, so an in-flight
 // request can still finish and the caller receives partial results instead of
@@ -70,31 +76,20 @@ function toBoolean(value, fallback) {
   return !['0', 'false', 'no', 'off'].includes(String(value).trim().toLowerCase());
 }
 
-function normalizeEngine(value) {
-  const normalized = String(value || '').trim().toLowerCase();
-  return normalized === 'duckduckgo' || normalized === 'ddg'
-    ? 'duckduckgo'
-    : 'google';
-}
-
-function engineLabel(engine) {
-  return engine === 'duckduckgo' ? 'DuckDuckGo' : 'Google';
-}
-
 const DEFAULTS = {
   maxPages: toPositiveInt(process.env.MAX_RESULT_PAGES, 10),
   targetResults: toPositiveInt(
     process.env.TARGET_ORGANIC_RESULTS,
     TARGET_ORGANIC_RESULTS
   ),
-  requestDelayMs: toNonNegativeInt(process.env.REQUEST_DELAY_MS, 1000),
+  // A short pause between pages keeps the scan polite and makes page-to-page
+  // timing less mechanical, which reduces the chance of a rate-limit response.
+  requestDelayMs: toNonNegativeInt(process.env.REQUEST_DELAY_MS, 1200),
   timeoutMs: toPositiveInt(process.env.REQUEST_TIMEOUT_MS, 15000),
   retries: 1,
-  engine: normalizeEngine(process.env.SEARCH_ENGINE || 'google'),
-  // Google is the primary source. When Google serves a challenge page or no
-  // result nodes, the scan falls back to DuckDuckGo automatically. Set
-  // DUCKDUCKGO_FALLBACK=false to disable the fallback.
-  fallbackToDuckDuckGo: toBoolean(process.env.DUCKDUCKGO_FALLBACK, true),
+  // When a direct request is blocked, retry through the free Jina Reader proxy.
+  // Set DDG_PROXY_FALLBACK=false to keep direct-only behaviour.
+  proxyFallback: toBoolean(process.env.DDG_PROXY_FALLBACK, true),
 };
 
 class ScraperError extends Error {
@@ -186,7 +181,7 @@ function pickRandom(items) {
  * Build a fresh set of realistic browser headers for every request.
  * Chrome/Edge profiles include matching Client Hints.
  */
-function buildHeaders({ referer, origin, contentType } = {}) {
+function buildHeaders({ referer, origin } = {}) {
   const profile = pickRandom(BROWSER_PROFILES);
 
   const headers = {
@@ -213,53 +208,6 @@ function buildHeaders({ referer, origin, contentType } = {}) {
 
   if (referer) headers.Referer = referer;
   if (origin) headers.Origin = origin;
-  if (contentType) headers['Content-Type'] = contentType;
-
-  return headers;
-}
-
-/**
- * Dedicated Google request headers: a stable, current Windows Chrome profile
- * with matching Client Hints, English locale, and a consent cookie. Keeping a
- * coherent header set (instead of mixing random profiles) gives Google far
- * fewer reasons to serve its JavaScript-only retry page.
- */
-const GOOGLE_CHROME_PROFILE = BROWSER_PROFILES[0];
-const GOOGLE_CONSENT_COOKIE =
-  'SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+410';
-
-/**
- * Browser header set sent with every Google SERP request. These must reach
- * axios (see requestPage) or Google treats the caller as a bare HTTP client and
- * answers datacenter IPs with its JavaScript-only retry page.
- */
-const BROWSER_HEADERS = {
-  'User-Agent': GOOGLE_CHROME_PROFILE.userAgent,
-  Accept: CHROME_ACCEPT,
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Cache-Control': 'no-cache',
-  Pragma: 'no-cache',
-  DNT: '1',
-  'Upgrade-Insecure-Requests': '1',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
-  Connection: 'keep-alive',
-  'sec-ch-ua': GOOGLE_CHROME_PROFILE.chUa,
-  'sec-ch-ua-mobile': '?0',
-  'sec-ch-ua-platform': GOOGLE_CHROME_PROFILE.platform,
-  Cookie: GOOGLE_CONSENT_COOKIE,
-};
-
-function buildGoogleHeaders({ referer } = {}) {
-  const headers = { ...BROWSER_HEADERS };
-
-  if (referer) {
-    headers.Referer = referer;
-    headers['Sec-Fetch-Site'] = 'same-origin';
-  }
 
   return headers;
 }
@@ -281,24 +229,6 @@ function cleanText(value) {
 function isDuckDuckGoHost(hostname) {
   const host = String(hostname || '').toLowerCase().replace(/\.$/, '');
   return host === 'duckduckgo.com' || host.endsWith('.duckduckgo.com');
-}
-
-function isGoogleHost(hostname) {
-  const host = String(hostname || '').toLowerCase().replace(/\.$/, '');
-  return /(^|\.)google\.[a-z]{2,}(\.[a-z]{2,})?$/.test(host);
-}
-
-function isGoogleOwnedHost(hostname) {
-  const host = String(hostname || '').toLowerCase().replace(/\.$/, '');
-  return (
-    isGoogleHost(host) ||
-    host === 'gstatic.com' ||
-    host.endsWith('.gstatic.com') ||
-    host === 'googleusercontent.com' ||
-    host.endsWith('.googleusercontent.com') ||
-    host === 'googleadservices.com' ||
-    host.endsWith('.googleadservices.com')
-  );
 }
 
 function getHostname(url) {
@@ -446,46 +376,8 @@ function resolveDuckDuckGoUrl(href) {
   return url.toString();
 }
 
-/**
- * Resolve a Google result href to the destination URL.
- * Google wraps external links as /url?q=<encoded-url>&sa=U...
- */
-function resolveGoogleUrl(href) {
-  if (!href || typeof href !== 'string') return null;
-
-  let url;
-  try {
-    url = new URL(href, GOOGLE_ORIGIN);
-  } catch {
-    return null;
-  }
-
-  if (isGoogleHost(url.hostname) && /^\/url\/?$/.test(url.pathname)) {
-    const target = url.searchParams.get('q') || url.searchParams.get('url');
-    if (!target) return null;
-
-    try {
-      url = new URL(target);
-    } catch {
-      try {
-        url = new URL(decodeURIComponent(target));
-      } catch {
-        return null;
-      }
-    }
-  }
-
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
-  if (isGoogleOwnedHost(url.hostname)) return null;
-
-  url.hash = '';
-  return url.toString();
-}
-
-function resolveResultUrl(href, engine = 'duckduckgo') {
-  return engine === 'google'
-    ? resolveGoogleUrl(href)
-    : resolveDuckDuckGoUrl(href);
+function resolveResultUrl(href) {
+  return resolveDuckDuckGoUrl(href);
 }
 
 /**
@@ -518,9 +410,7 @@ function matchesDomain(resultUrl, targetDomain, includeSubdomains = true) {
 
   if (normalizedHost === normalizedTarget) return true;
 
-  return (
-    includeSubdomains && normalizedHost.endsWith(`.${normalizedTarget}`)
-  );
+  return includeSubdomains && normalizedHost.endsWith(`.${normalizedTarget}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -535,133 +425,15 @@ const DUCKDUCKGO_CHALLENGE_PATTERNS = [
   /bots use DuckDuckGo/i,
 ];
 
-const GOOGLE_CHALLENGE_PATTERNS = [
-  /\/httpservice\/retry\/enablejs/i,
-  /enablejs\?sei=/i,
-  /id=["']captcha-form["']/i,
-  /\/sorry\/index/i,
-  /detected unusual traffic/i,
-  /unusual traffic from your computer/i,
-  /our systems have detected/i,
-  /please show you['’]re not a robot/i,
-  /id=["']recaptcha["']/i,
-  /g-recaptcha/i,
-  /recaptcha\/api\.js/i,
-  /verification challenge/i,
-];
-
-/**
- * Detect a captcha/consent/challenge page.
- * @returns {'CHALLENGE'|'CONSENT'|null}
- */
-function detectChallenge(html, engine) {
+function detectChallenge(html) {
   const text = String(html || '');
-
-  if (engine === 'google') {
-    if (/consent\.google\.com|before you continue to google/i.test(text)) {
-      return 'CONSENT';
-    }
-    return GOOGLE_CHALLENGE_PATTERNS.some((pattern) => pattern.test(text))
-      ? 'CHALLENGE'
-      : null;
-  }
-
   return DUCKDUCKGO_CHALLENGE_PATTERNS.some((pattern) => pattern.test(text))
     ? 'CHALLENGE'
     : null;
 }
 
-function hasOrganicMarkup(html, engine) {
-  if (engine === 'google') return /id=["']rso["']/i.test(html);
-  return /result__a/.test(html);
-}
-
-// ---------------------------------------------------------------------------
-// Google parsing
-// ---------------------------------------------------------------------------
-
-/**
- * Parse one Google results page.
- *
- * Google's result DOM changes regularly, so the parser works from result
- * blocks that contain a link with an <h3> title. Ads and Google-owned links are
- * discarded. Positions are tracked globally across pages (1, 2, 3, ...).
- *
- * @param {import('cheerio').CheerioAPI} $
- * @param {number} page            1-based Google result page number.
- * @param {number} startPosition   Position of the first result on this page.
- * @param {Set<string>} seenUrls   URLs already collected on previous pages.
- * @returns {{ results: Array<object>, organicCount: number }}
- */
-function parseGoogleResults($, page, startPosition, seenUrls = new Set()) {
-  const results = [];
-  let organicCount = 0;
-
-  let $blocks = $('#rso > div');
-  if ($blocks.length === 0) $blocks = $('#search div.g');
-  if ($blocks.length === 0) $blocks = $('#rso div.g');
-  if ($blocks.length === 0) $blocks = $('div.g');
-
-  $blocks.each((_, element) => {
-    const $block = $(element);
-
-    // Sponsored placements are not organic rankings.
-    if (
-      $block.closest(
-        '#tads, #bottomads, [data-text-ad], .uEierd, .commercial-unit-desktop-top'
-      ).length > 0
-    ) {
-      return;
-    }
-
-    const $anchor = $block
-      .find('a[href]')
-      .filter((__, anchor) => $(anchor).find('h3').length > 0)
-      .first();
-
-    if ($anchor.length === 0) return;
-
-    const title = cleanText($anchor.find('h3').first().text());
-    if (!title) return;
-
-    const url = resolveResultUrl($anchor.attr('href'), 'google');
-    if (!url) return;
-
-    organicCount += 1;
-    const position = startPosition + organicCount - 1;
-
-    // Keep the position open for a duplicate URL, but only return it once.
-    if (seenUrls.has(url)) return;
-    seenUrls.add(url);
-
-    const hostname = getHostname(url);
-    if (!hostname) return;
-
-    const displayUrl = cleanText(
-      $block.find('cite').first().text() ||
-        $block.find('.VuuXrf').first().text() ||
-        $block.find('.TbwUpd').first().text()
-    );
-
-    const snippet = cleanText(
-      $block
-        .find('div.VwiC3b, span.aCOpRe, div.IsZvec, div[data-sncf]')
-        .first()
-        .text()
-    );
-
-    results.push({
-      position,
-      page,
-      title,
-      url,
-      domain: hostname,
-      displayUrl,
-      snippet,
-    });
-  });
-
-  return { results, organicCount };
+function hasOrganicMarkup(html) {
+  return /result__a|result-link/.test(html);
 }
 
 // ---------------------------------------------------------------------------
@@ -703,11 +475,10 @@ function parseResults($, page, startPosition, seenUrls = new Set()) {
     if ($anchor.length === 0) $anchor = $result.find('h2 a[href]').first();
     if ($anchor.length === 0) return;
 
-    let url = resolveResultUrl($anchor.attr('href'), 'duckduckgo');
+    let url = resolveDuckDuckGoUrl($anchor.attr('href'));
     if (!url) {
-      url = resolveResultUrl(
-        $result.find('a.result__url').first().attr('href'),
-        'duckduckgo'
+      url = resolveDuckDuckGoUrl(
+        $result.find('a.result__url').first().attr('href')
       );
     }
     if (!url) return;
@@ -741,7 +512,7 @@ function parseResults($, page, startPosition, seenUrls = new Set()) {
 
 /**
  * Find the "Next" pagination form and collect its hidden fields.
- * DuckDuckGo requires a POST with these fields for pages after the first.
+ * DuckDuckGo exposes the result offset in a hidden `s` input.
  */
 function extractNextPageForm($) {
   const forms = $('.nav-link form').toArray();
@@ -839,106 +610,64 @@ function resolveDuckDuckGoNextOffset($, currentOffset, resultsScanned) {
   );
 }
 
-function buildGoogleSearchUrl(query, start = 0) {
-  const url = new URL(GOOGLE_SEARCH_URL);
-  url.searchParams.set('q', query);
-  url.searchParams.set('num', String(GOOGLE_RESULTS_PER_PAGE));
-  url.searchParams.set('hl', 'en');
-  url.searchParams.set('start', String(start));
-  // Web-only results, signed out, without personalization.
-  url.searchParams.set('udm', '14');
-  url.searchParams.set('igu', '1');
-  url.searchParams.set('pws', '0');
-  return url.toString();
-}
-
-// ---------------------------------------------------------------------------
-// ScraperAPI proxy (optional)
-// ---------------------------------------------------------------------------
-
-const SCRAPER_API_ENDPOINT = 'https://api.scraperapi.com';
-
-// Google requests are rendered in a real browser (render=true) and exit from an
-// Indian IP (country_code=in), which is what gets past the JS retry challenge.
-const SCRAPER_API_GOOGLE_PARAMS = 'country_code=in&render=true';
-
-// ScraperAPI solves Google's JS retry page in its own browser, which routinely
-// takes longer than a direct scrape, so proxied requests get extra headroom.
-const SCRAPER_API_MIN_TIMEOUT_MS = 60000;
-
-// Rendered ScraperAPI fetches are slow and bill credits, so paging through
-// them is spaced further apart than direct requests to stay clear of limits.
-const SCRAPER_API_PAGE_DELAY_MS = 3000;
-
-function getScraperApiKey() {
-  return String(process.env.SCRAPER_API_KEY || '').trim();
-}
-
-/**
- * Wrap `targetUrl` in a ScraperAPI request. ScraperAPI fetches the URL from
- * its own IPs (so datacenter blocks and the JavaScript retry page are handled
- * upstream) and returns the engine response HTML unchanged. Returns null when
- * no key is configured, which makes callers hit the engine directly.
- */
-function buildScraperApiUrl(targetUrl, extraQuery = '') {
-  const apiKey = getScraperApiKey();
-  if (!apiKey) return null;
-
-  const suffix = extraQuery ? `&${extraQuery}` : '';
-  return `${SCRAPER_API_ENDPOINT}?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}${suffix}`;
-}
-
 // ---------------------------------------------------------------------------
 // HTTP layer
 // ---------------------------------------------------------------------------
 
-async function requestPage({
-  engine,
-  method,
-  url,
-  data,
-  referer,
-  origin,
-  timeoutMs,
-  retries,
-  signal,
-}) {
+/**
+ * Validate a SERP response and return its HTML. Shared by the direct and proxy
+ * transports so both classify blocks, challenges, and HTTP errors identically.
+ */
+function readResponse(html, status, provider) {
+  if (status === 403 || status === 429) {
+    throw new ScraperError(`${provider} blocked the request (HTTP ${status}).`, {
+      code: 'BLOCKED',
+      status,
+    });
+  }
+
+  if (status === 202 && !hasOrganicMarkup(html)) {
+    throw new ScraperError(`${provider} returned a challenge page (HTTP 202).`, {
+      code: 'CHALLENGE',
+      status,
+    });
+  }
+
+  if (status < 200 || status >= 300) {
+    throw new ScraperError(`${provider} returned HTTP ${status}.`, {
+      code: 'HTTP_ERROR',
+      status,
+    });
+  }
+
+  const challengeCode = detectChallenge(html);
+  if (challengeCode && !hasOrganicMarkup(html)) {
+    throw new ScraperError(
+      `${provider} returned a bot challenge page instead of results.`,
+      { code: challengeCode, status }
+    );
+  }
+
+  return html;
+}
+
+/**
+ * Fetch one SERP page directly from DuckDuckGo.
+ *
+ * Each attempt uses a fresh browser header profile. Axios resolves non-2xx
+ * responses so block/challenge pages can be classified instead of surfacing as
+ * generic network errors.
+ */
+async function fetchDirect({ url, referer, origin, timeoutMs, retries, signal }) {
   let lastError;
-  // Both engines go through ScraperAPI when a key is configured, so Render's
-  // IP is never sent to Google or DuckDuckGo directly.
-  const scraperApiUrl = buildScraperApiUrl(
-    url,
-    engine === 'google' ? SCRAPER_API_GOOGLE_PARAMS : ''
-  );
-  const viaScraperApi = Boolean(scraperApiUrl);
-  const provider = viaScraperApi ? 'ScraperAPI' : engineLabel(engine);
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      // ScraperAPI supplies its own browser fingerprint and solves Google's JS
-      // retry page, so forwarded browser headers would only add noise. Direct
-      // Google requests get BROWSER_HEADERS; other engines a rotated profile.
-      let headers;
-      if (viaScraperApi) {
-        headers = {};
-      } else if (engine === 'google') {
-        headers = buildGoogleHeaders({ referer });
-      } else {
-        headers = buildHeaders({
-          referer,
-          origin,
-          contentType: data ? 'application/x-www-form-urlencoded' : undefined,
-        });
-      }
-
       const response = await axios.request({
-        method: viaScraperApi ? 'GET' : method,
-        url: viaScraperApi ? scraperApiUrl : url,
-        data: viaScraperApi ? undefined : data,
-        headers,
-        timeout: viaScraperApi
-          ? Math.max(timeoutMs, SCRAPER_API_MIN_TIMEOUT_MS)
-          : timeoutMs,
+        method: 'GET',
+        url,
+        headers: buildHeaders({ referer, origin }),
+        timeout: timeoutMs,
         responseType: 'text',
         maxRedirects: 5,
         signal,
@@ -946,81 +675,18 @@ async function requestPage({
       });
 
       const html =
-        typeof response.data === 'string' ? response.data : String(response.data ?? '');
-      const status = response.status;
+        typeof response.data === 'string'
+          ? response.data
+          : String(response.data ?? '');
 
-      if (viaScraperApi && status === 401) {
-        throw new ScraperError(
-          'ScraperAPI rejected the request (HTTP 401) - check SCRAPER_API_KEY.',
-          { code: 'AUTH', status }
-        );
-      }
-
-      // ScraperAPI reports an exhausted monthly quota as HTTP 403 with an
-      // explanatory body. Surface it as its own code so the UI does not claim
-      // the search engine rate-limited us.
-      if (
-        viaScraperApi &&
-        status === 403 &&
-        /exhausted the API Credits|credit limit/i.test(html)
-      ) {
-        throw new ScraperError(
-          'ScraperAPI has no credits left for this billing cycle, so search results could not be fetched.',
-          { code: 'NO_CREDITS', status }
-        );
-      }
-
-      if (status === 403 || status === 429) {
-        throw new ScraperError(
-          `${provider} blocked the request (HTTP ${status}).`,
-          { code: 'BLOCKED', status }
-        );
-      }
-
-      if (status === 202 && !hasOrganicMarkup(html, engine)) {
-        throw new ScraperError(
-          `${provider} returned a challenge page (HTTP 202).`,
-          { code: 'CHALLENGE', status }
-        );
-      }
-
-      if (status < 200 || status >= 300) {
-        throw new ScraperError(`${provider} returned HTTP ${status}.`, {
-          code: 'HTTP_ERROR',
-          status,
-        });
-      }
-
-      const challengeCode = detectChallenge(html, engine);
-      if (challengeCode && !hasOrganicMarkup(html, engine)) {
-        const jsRetryPage =
-          engine === 'google' &&
-          /\/httpservice\/retry\/enablejs|enablejs\?sei=/i.test(html);
-
-        throw new ScraperError(
-          jsRetryPage
-            ? 'Google returned a JavaScript-only retry page instead of organic results.'
-            : challengeCode === 'CONSENT'
-              ? `${provider} returned a consent page instead of results.`
-              : `${provider} returned a bot challenge page.`,
-          { code: challengeCode, status }
-        );
-      }
-
-      return html;
+      return readResponse(html, response.status, 'DuckDuckGo');
     } catch (error) {
       lastError = error;
 
-      if (
-        signal?.aborted ||
-        error.name === 'AbortError' ||
-        error.code === 'ERR_CANCELED'
-      ) {
-        throw error;
-      }
+      if (isAbortError(error, signal)) throw error;
 
       if (attempt < retries) {
-        // Brief jittered backoff before retrying with a fresh random User-Agent.
+        // Brief jittered backoff before retrying with a fresh User-Agent.
         await sleep(1500 + attempt * 1000 + Math.floor(Math.random() * 750));
       }
     }
@@ -1029,9 +695,117 @@ async function requestPage({
   if (lastError instanceof ScraperError) throw lastError;
 
   throw new ScraperError(
-    `Failed to fetch ${provider} results: ${lastError?.message || 'unknown error'}`,
+    `Failed to fetch DuckDuckGo results: ${lastError?.message || 'unknown error'}`,
     { code: 'REQUEST_FAILED', cause: lastError }
   );
+}
+
+/**
+ * Fetch the same DuckDuckGo page through Jina Reader.
+ *
+ * `X-Return-Format: html` makes Jina return the upstream DuckDuckGo markup
+ * unchanged, so the vqd token, next-page form, and result nodes all survive and
+ * the normal parser can be reused.
+ */
+async function fetchViaProxy({ url, timeoutMs, retries, signal }) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await axios.request({
+        method: 'GET',
+        url: `${JINA_READER_URL}${url}`,
+        headers: {
+          'X-Return-Format': 'html',
+          Accept: 'text/html,application/xhtml+xml',
+          'User-Agent': pickRandom(BROWSER_PROFILES).userAgent,
+        },
+        timeout: Math.max(timeoutMs, JINA_MIN_TIMEOUT_MS),
+        responseType: 'text',
+        maxRedirects: 5,
+        signal,
+        validateStatus: () => true,
+      });
+
+      const html =
+        typeof response.data === 'string'
+          ? response.data
+          : String(response.data ?? '');
+
+      // Jina reports upstream failures as a 200 text response. Treat those as a
+      // provider error instead of a legitimate "no results" page.
+      if (
+        !hasOrganicMarkup(html) &&
+        /Target URL returned error|Failed to fetch|Unable to fetch/i.test(html)
+      ) {
+        throw new ScraperError(
+          'The DuckDuckGo proxy could not fetch search results.',
+          { code: 'REQUEST_FAILED', status: response.status }
+        );
+      }
+
+      return readResponse(html, response.status, 'The DuckDuckGo proxy');
+    } catch (error) {
+      lastError = error;
+
+      if (isAbortError(error, signal)) throw error;
+
+      if (attempt < retries) {
+        await sleep(2000 + attempt * 1000 + Math.floor(Math.random() * 750));
+      }
+    }
+  }
+
+  if (lastError instanceof ScraperError) throw lastError;
+
+  throw new ScraperError(
+    `Failed to fetch DuckDuckGo results through the proxy: ${
+      lastError?.message || 'unknown error'
+    }`,
+    { code: 'REQUEST_FAILED', cause: lastError }
+  );
+}
+
+/**
+ * Fetch one SERP page, preferring a direct request and falling back to the free
+ * proxy when the host's IP is blocked. `transport` is carried across pages so a
+ * scan that falls back once keeps using the proxy for the rest of its pages.
+ */
+async function requestPage({
+  url,
+  referer,
+  origin,
+  timeoutMs,
+  retries,
+  signal,
+  transport,
+  proxyFallback,
+}) {
+  if (transport === 'proxy') {
+    return {
+      html: await fetchViaProxy({ url, timeoutMs, retries, signal }),
+      transport: 'proxy',
+    };
+  }
+
+  try {
+    const html = await fetchDirect({
+      url,
+      referer,
+      origin,
+      timeoutMs,
+      retries,
+      signal,
+    });
+    return { html, transport: 'direct' };
+  } catch (error) {
+    if (isAbortError(error, signal) || !proxyFallback) throw error;
+
+    return {
+      html: await fetchViaProxy({ url, timeoutMs, retries, signal }),
+      transport: 'proxy',
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,7 +813,6 @@ async function requestPage({
 // ---------------------------------------------------------------------------
 
 function buildFoundResult({
-  engine,
   keyword,
   targetDomain,
   result,
@@ -1051,7 +824,7 @@ function buildFoundResult({
     found: true,
     keyword,
     domain: targetDomain,
-    engine,
+    engine: 'duckduckgo',
     position: result.position,
     page: result.page,
     url: result.url,
@@ -1068,7 +841,6 @@ function buildFoundResult({
 }
 
 function buildNotFoundResult({
-  engine,
   keyword,
   targetDomain,
   resultsScanned,
@@ -1083,7 +855,7 @@ function buildNotFoundResult({
     found: false,
     keyword,
     domain: targetDomain,
-    engine,
+    engine: 'duckduckgo',
     position: null,
     page: null,
     url: null,
@@ -1098,7 +870,7 @@ function buildNotFoundResult({
     message:
       `No match found for "${targetDomain}" after scanning ` +
       `${resultsScanned} organic ${resultWord} across ${pagesChecked} ` +
-      `${pageWord} on ${engineLabel(engine)}.` +
+      `${pageWord} on DuckDuckGo.` +
       (partialReason
         ? partialReason === 'TIME_BUDGET'
           ? ' The scan stopped early to stay inside the request time limit.'
@@ -1110,16 +882,12 @@ function buildNotFoundResult({
 }
 
 const BLOCKED_MESSAGE =
-  'Search engines are temporarily rate-limiting requests from this server, so ' +
-  'the ranking could not be measured. Please try again in a minute.';
+  'DuckDuckGo is temporarily rate-limiting requests from this server, so the ' +
+  'ranking could not be measured. Please try again in a minute.';
 
 const UNAVAILABLE_MESSAGE =
   'Search results could not be fetched right now, so the ranking could not be ' +
   'measured. Please try again in a minute.';
-
-const NO_CREDITS_MESSAGE =
-  'The scraping provider has no credits left for this billing cycle, so the ' +
-  'ranking could not be measured. Add credits or wait for the plan to reset.';
 
 /**
  * Soft failure: the ranking is not claimed, but callers still receive a normal
@@ -1127,7 +895,6 @@ const NO_CREDITS_MESSAGE =
  * block page never surfaces as a verification-challenge popup.
  */
 function buildUnavailableResult({
-  engine,
   keyword,
   targetDomain,
   checkedAt,
@@ -1138,7 +905,7 @@ function buildUnavailableResult({
     found: false,
     keyword,
     domain: targetDomain,
-    engine,
+    engine: 'duckduckgo',
     position: null,
     page: null,
     url: null,
@@ -1158,142 +925,8 @@ function buildUnavailableResult({
 }
 
 // ---------------------------------------------------------------------------
-// Engine scanners
+// DuckDuckGo scanner
 // ---------------------------------------------------------------------------
-
-async function scanGoogle({
-  query,
-  targetDomain,
-  maxPages,
-  targetResults,
-  requestDelayMs,
-  timeoutMs,
-  retries,
-  includeSubdomains,
-  signal,
-  checkedAt,
-  deadlineAt,
-  minPageBudgetMs,
-}) {
-  const seenUrls = new Set();
-  let resultsScanned = 0;
-  let pagesChecked = 0;
-  let startPosition = 1;
-  let referer;
-  let partialReason = null;
-
-  for (let page = 1; page <= maxPages; page += 1) {
-    if (page > 1) {
-      const remainingMs = deadlineAt ? deadlineAt - nowMs() : Infinity;
-
-      // Return the pages already collected instead of losing everything to the
-      // caller's hard timeout.
-      if (remainingMs < minPageBudgetMs) {
-        partialReason = 'TIME_BUDGET';
-        break;
-      }
-
-      // Small jitter makes page-to-page timing less mechanical.
-      await sleep(requestDelayMs + Math.floor(Math.random() * 500));
-    }
-
-    const url = buildGoogleSearchUrl(
-      query,
-      (page - 1) * GOOGLE_RESULTS_PER_PAGE
-    );
-
-    let html;
-    try {
-      html = await requestPage({
-        engine: 'google',
-        method: 'GET',
-        url,
-        data: undefined,
-        referer,
-        origin: page > 1 ? GOOGLE_ORIGIN : undefined,
-        timeoutMs,
-        retries,
-        signal,
-      });
-    } catch (error) {
-      if (isAbortError(error, signal)) throw error;
-
-      // Page 1 failing means Google is unusable right now, so let the caller
-      // try the fallback engine. Once earlier pages are already scanned, a
-      // rate limit should only end the deep scan: keep the work done so far.
-      if (page === 1) throw error;
-      partialReason = error.code || 'REQUEST_FAILED';
-      break;
-    }
-
-    pagesChecked = page;
-
-    const $ = cheerio.load(html);
-    const { results, organicCount } = parseGoogleResults(
-      $,
-      page,
-      startPosition,
-      seenUrls
-    );
-
-    if (organicCount === 0) {
-      if (page === 1) {
-        const jsOnlyPage = /httpservice\/retry\/enablejs|enablejs/i.test(html);
-        if (jsOnlyPage) {
-          throw new ScraperError(
-            'Google returned a JavaScript-only retry page instead of organic results.',
-            { code: 'CHALLENGE', status: 503 }
-          );
-        }
-
-        throw new ScraperError(
-          'Google returned no organic results for this keyword.',
-          { code: 'EMPTY_RESULTS', status: 200 }
-        );
-      }
-      break;
-    }
-
-    resultsScanned += organicCount;
-    startPosition = resultsScanned + 1;
-
-    for (const result of results) {
-      if (matchesDomain(result.url, targetDomain, includeSubdomains)) {
-        return buildFoundResult({
-          engine: 'google',
-          keyword: query,
-          targetDomain,
-          result,
-          resultsScanned,
-          pagesChecked,
-          checkedAt,
-        });
-      }
-    }
-
-    // Stop as soon as enough organic links were read (default: 100 links from
-    // ten pages), which also bounds ScraperAPI credit usage.
-    if (resultsScanned >= targetResults) break;
-
-    if (page >= maxPages) break;
-
-    const hasNextPage =
-      $('#pnnext').length > 0 || $('a[aria-label="Next page"]').length > 0;
-    if (!hasNextPage) break;
-
-    referer = url;
-  }
-
-  return buildNotFoundResult({
-    engine: 'google',
-    keyword: query,
-    targetDomain,
-    resultsScanned,
-    pagesChecked,
-    checkedAt,
-    partialReason,
-  });
-}
 
 async function scanDuckDuckGo({
   query,
@@ -1308,6 +941,7 @@ async function scanDuckDuckGo({
   checkedAt,
   deadlineAt,
   minPageBudgetMs,
+  proxyFallback,
 }) {
   const seenUrls = new Set();
   let resultsScanned = 0;
@@ -1317,6 +951,7 @@ async function scanDuckDuckGo({
   let vqd = '';
   let partialReason = null;
   let referer;
+  let transport;
 
   for (let page = 1; page <= maxPages; page += 1) {
     if (page > 1) {
@@ -1329,25 +964,33 @@ async function scanDuckDuckGo({
         break;
       }
 
+      // Proxy requests are slower and rate-limited, so space them out further.
+      const pageDelay =
+        transport === 'proxy'
+          ? Math.max(requestDelayMs, PROXY_PAGE_DELAY_MS)
+          : requestDelayMs;
+
       // Small jitter makes page-to-page timing less mechanical.
-      await sleep(requestDelayMs + Math.floor(Math.random() * 500));
+      await sleep(pageDelay + Math.floor(Math.random() * 500));
     }
 
-    let html;
     const pageUrl = buildDuckDuckGoPageUrl(query, offset, vqd);
 
+    let html;
     try {
-      html = await requestPage({
-        engine: 'duckduckgo',
-        method: 'GET',
+      const response = await requestPage({
         url: pageUrl,
-        data: undefined,
         referer,
         origin: page > 1 ? DUCKDUCKGO_ORIGIN : undefined,
         timeoutMs,
         retries,
         signal,
+        transport,
+        proxyFallback,
       });
+
+      html = response.html;
+      if (response.transport === 'proxy') transport = 'proxy';
     } catch (error) {
       if (isAbortError(error, signal)) throw error;
 
@@ -1374,7 +1017,6 @@ async function scanDuckDuckGo({
     if (organicCount === 0) {
       if (page === 1) {
         return buildNotFoundResult({
-          engine: 'duckduckgo',
           keyword: query,
           targetDomain,
           resultsScanned,
@@ -1391,7 +1033,6 @@ async function scanDuckDuckGo({
     for (const result of results) {
       if (matchesDomain(result.url, targetDomain, includeSubdomains)) {
         return buildFoundResult({
-          engine: 'duckduckgo',
           keyword: query,
           targetDomain,
           result,
@@ -1403,7 +1044,7 @@ async function scanDuckDuckGo({
     }
 
     // Stop as soon as enough organic links were read, or when the page cap is
-    // reached. This keeps ScraperAPI credit usage bounded.
+    // reached. This bounds the number of outbound requests per check.
     if (resultsScanned >= targetResults) break;
     if (page >= maxPages) break;
 
@@ -1422,7 +1063,6 @@ async function scanDuckDuckGo({
   }
 
   return buildNotFoundResult({
-    engine: 'duckduckgo',
     keyword: query,
     targetDomain,
     resultsScanned,
@@ -1437,37 +1077,27 @@ async function scanDuckDuckGo({
 // ---------------------------------------------------------------------------
 
 /**
- * Check where `domain` ranks for `keyword` in organic search results.
- *
- * Google is the primary source. If Google serves a verification challenge
- * (captcha, "unusual traffic", g-recaptcha) or no result nodes at all, the
- * check automatically retries the keyword on DuckDuckGo. Pass
- * `fallbackToDuckDuckGo: false` (or DUCKDUCKGO_FALLBACK=false) to disable.
+ * Check where `domain` ranks for `keyword` in DuckDuckGo's organic results.
  *
  * @param {string} domain  Domain or URL, e.g. "example.com" or "https://www.example.com/path".
  * @param {string} keyword Search query.
  * @param {object} [options]
- * @param {number} [options.maxPages]                 Hard cap on SERP pages (default: MAX_RESULT_PAGES or 10).
- * @param {number} [options.targetResults]            Stop after this many organic links (default: TARGET_ORGANIC_RESULTS or 100).
- * @param {number} [options.requestDelayMs]           Delay between page requests in ms (default: REQUEST_DELAY_MS or 1000, raised to 3000 while paging through ScraperAPI).
- * @param {number} [options.timeoutMs]                Per-request timeout in ms (default: REQUEST_TIMEOUT_MS or 15000).
- * @param {number} [options.retries]                  Retry attempts per page request (default: 1).
- * @param {number} [options.timeBudgetMs]             Soft scan deadline in ms; paging stops early and returns partial results when time runs out (default: none).
- * @param {boolean} [options.includeSubdomains]       Match subdomains too (default: true).
- * @param {'google'|'duckduckgo'} [options.engine]    Primary engine (default: SEARCH_ENGINE or google).
- * @param {boolean} [options.fallbackToDuckDuckGo]    Fall back to DDG when Google is blocked or empty (default: true).
- * @param {AbortSignal} [options.signal]              Optional abort signal.
- * @returns {Promise<object>} Ranking result. `found` is false when the domain is not in the scanned pages, and `unavailable` is true when no engine could be read at all.
+ * @param {number} [options.maxPages]              Hard cap on SERP pages (default: MAX_RESULT_PAGES or 10).
+ * @param {number} [options.targetResults]         Stop after this many organic links (default: TARGET_ORGANIC_RESULTS or 100).
+ * @param {number} [options.requestDelayMs]        Delay between page requests in ms (default: REQUEST_DELAY_MS or 1200).
+ * @param {number} [options.timeoutMs]             Per-request timeout in ms (default: REQUEST_TIMEOUT_MS or 15000).
+ * @param {number} [options.retries]               Retry attempts per page request (default: 1).
+ * @param {number} [options.timeBudgetMs]          Soft scan deadline in ms; paging stops early and returns partial results when time runs out.
+ * @param {boolean} [options.includeSubdomains]    Match subdomains too (default: true).
+ * @param {boolean} [options.proxyFallback]        Retry blocked direct requests through the free reader proxy (default: DDG_PROXY_FALLBACK or true).
+ * @param {AbortSignal} [options.signal]           Optional abort signal.
+ * @returns {Promise<object>} Ranking result. `found` is false when the domain is not in the scanned pages, and `unavailable` is true when DuckDuckGo could not be read at all.
  */
 async function checkKeywordRank(domain, keyword, options = {}) {
   try {
     return await runKeywordCheck(domain, keyword, options);
   } catch (error) {
-    if (
-      options?.signal?.aborted ||
-      error?.name === 'AbortError' ||
-      error?.code === 'ERR_CANCELED'
-    ) {
+    if (isAbortError(error, options?.signal)) {
       throw error;
     }
 
@@ -1493,13 +1123,16 @@ async function checkKeywordRank(domain, keyword, options = {}) {
       /* keep the raw value */
     }
 
+    const code = error?.code || 'REQUEST_FAILED';
+
     return buildUnavailableResult({
-      engine: normalizeEngine(options?.engine ?? DEFAULTS.engine),
       keyword: safeKeyword,
       targetDomain: safeDomain,
       checkedAt: new Date().toISOString(),
-      code: error?.code || 'REQUEST_FAILED',
-      message: UNAVAILABLE_MESSAGE,
+      code,
+      message: ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(code)
+        ? BLOCKED_MESSAGE
+        : UNAVAILABLE_MESSAGE,
     });
   }
 }
@@ -1513,121 +1146,45 @@ async function runKeywordCheck(domain, keyword, options = {}) {
     options.targetResults,
     DEFAULTS.targetResults
   );
-  // Rendered ScraperAPI pages are slow and bill credits, so deep scans space
-  // them out further. An explicit caller delay still wins.
-  const defaultPageDelayMs = getScraperApiKey()
-    ? Math.max(DEFAULTS.requestDelayMs, SCRAPER_API_PAGE_DELAY_MS)
-    : DEFAULTS.requestDelayMs;
   const requestDelayMs = toNonNegativeInt(
     options.requestDelayMs,
-    defaultPageDelayMs
+    DEFAULTS.requestDelayMs
   );
   const timeoutMs = toPositiveInt(options.timeoutMs, DEFAULTS.timeoutMs);
   const retries = toNonNegativeInt(options.retries, DEFAULTS.retries);
   const includeSubdomains = options.includeSubdomains !== false;
+  const proxyFallback =
+    options.proxyFallback === undefined
+      ? DEFAULTS.proxyFallback
+      : Boolean(options.proxyFallback);
   const signal = options.signal;
 
   // Soft deadline: the scanner stops starting new pages once the remaining
   // time cannot cover one more request, so the caller gets partial results
-  // before its hard AbortSignal fires.
+  // before its hard AbortSignal fires. Proxy requests can take longer than a
+  // direct scrape, so reserve enough time for one of those.
   const timeBudgetMs = toNonNegativeInt(options.timeBudgetMs, 0);
-  const deadlineAt =
-    timeBudgetMs > 0 ? nowMs() + timeBudgetMs : null;
-  const minPageBudgetMs = getScraperApiKey()
-    ? Math.max(SCRAPER_API_MIN_TIMEOUT_MS + 5000, MIN_PAGE_BUDGET_MS)
-    : Math.max(timeoutMs + 5000, MIN_PAGE_BUDGET_MS);
-
-  const primaryEngine = normalizeEngine(
-    options.engine === undefined ? DEFAULTS.engine : options.engine
+  const deadlineAt = timeBudgetMs > 0 ? nowMs() + timeBudgetMs : null;
+  const minPageBudgetMs = Math.max(
+    timeoutMs + 5000,
+    proxyFallback ? JINA_MIN_TIMEOUT_MS + 5000 : 0,
+    MIN_PAGE_BUDGET_MS
   );
-  const fallbackToDuckDuckGo =
-    options.fallbackToDuckDuckGo === undefined
-      ? DEFAULTS.fallbackToDuckDuckGo
-      : Boolean(options.fallbackToDuckDuckGo);
 
-  const engines =
-    primaryEngine === 'duckduckgo'
-      ? ['duckduckgo']
-      : fallbackToDuckDuckGo
-        ? ['google', 'duckduckgo']
-        : ['google'];
-
-  const checkedAt = new Date().toISOString();
-  const attempts = [];
-
-  for (const engine of engines) {
-    try {
-      const scanner = engine === 'google' ? scanGoogle : scanDuckDuckGo;
-      const result = await scanner({
-        query,
-        targetDomain,
-        maxPages,
-        targetResults,
-        requestDelayMs,
-        timeoutMs,
-        retries,
-        includeSubdomains,
-        signal,
-        checkedAt,
-        deadlineAt,
-        minPageBudgetMs,
-      });
-
-      if (attempts.length > 0) {
-        result.fallback = true;
-        result.fallbackFrom = attempts.map((attempt) => attempt.engine);
-        result.fallbackReason = attempts[0].message;
-      }
-
-      return result;
-    } catch (error) {
-      if (
-        signal?.aborted ||
-        error.name === 'AbortError' ||
-        error.code === 'ERR_CANCELED'
-      ) {
-        throw error;
-      }
-
-      if (
-        error instanceof ScraperError &&
-        (error.code === 'INVALID_DOMAIN' || error.code === 'INVALID_KEYWORD')
-      ) {
-        throw error;
-      }
-
-      attempts.push({
-        engine,
-        code: error.code || 'REQUEST_FAILED',
-        message: error.message,
-        error,
-      });
-    }
-  }
-
-  const lastAttempt = attempts[attempts.length - 1];
-  const blockedAttempt =
-    attempts.find((attempt) => attempt.code === 'NO_CREDITS') ||
-    attempts.find((attempt) =>
-      ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(attempt.code)
-    ) ||
-    lastAttempt;
-
-  const finalCode = blockedAttempt?.code || 'REQUEST_FAILED';
-  const message =
-    finalCode === 'NO_CREDITS'
-      ? NO_CREDITS_MESSAGE
-      : ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(finalCode)
-        ? BLOCKED_MESSAGE
-        : UNAVAILABLE_MESSAGE;
-
-  return buildUnavailableResult({
-    engine: blockedAttempt?.engine || primaryEngine,
-    keyword: query,
+  return scanDuckDuckGo({
+    query,
     targetDomain,
-    checkedAt,
-    code: finalCode,
-    message,
+    maxPages,
+    targetResults,
+    requestDelayMs,
+    timeoutMs,
+    retries,
+    includeSubdomains,
+    signal,
+    checkedAt: new Date().toISOString(),
+    deadlineAt,
+    minPageBudgetMs,
+    proxyFallback,
   });
 }
 
@@ -1637,7 +1194,7 @@ module.exports = {
   normalizeKeyword,
   normalizeUrlForComparison,
   parseResults,
-  parseGoogleResults,
+  parseDuckDuckGoResults: parseResults,
   extractNextPageForm,
   buildDuckDuckGoPageUrl,
   extractDuckDuckGoVqd,
@@ -1645,11 +1202,7 @@ module.exports = {
   resolveResultUrl,
   matchesDomain,
   buildHeaders,
-  buildGoogleSearchUrl,
   detectChallenge,
-  normalizeEngine,
   ScraperError,
-  SEARCH_URL: GOOGLE_SEARCH_URL,
-  GOOGLE_SEARCH_URL,
   DUCKDUCKGO_SEARCH_URL,
 };

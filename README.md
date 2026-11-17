@@ -1,14 +1,14 @@
 # RankPulse — Free Keyword Rank Checker & SEO Rank Tracker
 
-A small Node.js/Express app that checks where a domain ranks in Google search results, with an automatic DuckDuckGo fallback. It scrapes the public HTML SERP directly — no paid API keys, no accounts, no database.
+A small Node.js/Express app that checks where a domain ranks in DuckDuckGo search results. It scrapes DuckDuckGo's public HTML endpoint directly with `axios` and `cheerio` — no paid API keys, no accounts, no database.
 
 ## Features
 
-- **Google-first rank checks** against live Google organic results
-- **Automatic DuckDuckGo fallback** when Google serves a captcha, consent page, or is unavailable
+- **Free rank checks** against live DuckDuckGo organic results, with no API key
+- **Direct HTML scraping** via `axios` + `cheerio`; no paid scraping provider
 - **Deep SERP scans** — 10 pages by default (~100 organic results, configurable up to 10 pages), so lower-ranking domains are still found
 - **Position and page** for the matched result (or a clear “not found” state with scan counts)
-- **Smart request handling** — randomized browser headers, user-agent rotation, and jittered pacing
+- **Respectful request handling** — randomized browser headers, user-agent rotation, and jittered pacing between pages
 - **Polished dark UI** with responsive layouts, loading states, result cards, and error toasts
 - **On-page SEO** — keyword-focused title/description, Open Graph and Twitter cards, JSON-LD, and semantic heading structure
 - **Rate limiting** on the API surface and validation on every request
@@ -47,7 +47,7 @@ Successful response:
   "found": true,
   "domain": "expressjs.com",
   "keyword": "express framework",
-  "engine": "google",
+  "engine": "duckduckgo",
   "position": 7,
   "page": 1,
   "url": "https://expressjs.com/",
@@ -57,8 +57,7 @@ Successful response:
   "scannedResults": 10,
   "pagesChecked": 1,
   "checkedAt": "2026-11-04T09:03:00.000Z",
-  "message": null,
-  "fallback": false
+  "message": null
 }
 ```
 
@@ -68,11 +67,11 @@ When the domain is not found, the endpoint still returns `200` with a clear mess
 {
   "success": true,
   "found": false,
-  "engine": "google",
+  "engine": "duckduckgo",
   "position": null,
   "resultsScanned": 100,
   "pagesChecked": 10,
-  "message": "No match found for \"example.com\" after scanning 100 organic results across 10 pages on Google."
+  "message": "No match found for \"example.com\" after scanning 100 organic results across 10 pages on DuckDuckGo."
 }
 ```
 
@@ -81,7 +80,7 @@ When the domain is not found, the endpoint still returns `200` with a clear mess
 Error responses use a stable shape:
 
 ```json
-{ "success": false, "code": "CHALLENGE", "error": "Google and DuckDuckGo could not return organic results right now (captcha, consent, or a JavaScript-only response). Wait about a minute, then try again." }
+{ "success": false, "code": "CHALLENGE", "error": "DuckDuckGo is temporarily rate-limiting requests from this server, so the ranking could not be measured. Please try again in a minute." }
 ```
 
 | Status | Code                   | Meaning                                           |
@@ -93,9 +92,9 @@ Error responses use a stable shape:
 | 502    | `REQUEST_FAILED`       | The search request failed (network/timeout)       |
 | 502    | `EMPTY_RESULTS`        | No organic results could be parsed                |
 | 502    | `INSUFFICIENT_RESULTS` | The provider stopped before a full scan           |
-| 503    | `CHALLENGE`            | A search engine served a captcha/challenge page   |
-| 503    | `BLOCKED`              | The search provider is rate-limiting requests     |
-| 503    | `CONSENT`              | Google served a consent page instead of results   |
+| 503    | `CHALLENGE`            | DuckDuckGo served a captcha/challenge page        |
+| 503    | `BLOCKED`              | DuckDuckGo is rate-limiting requests              |
+| 503    | `CONSENT`              | A consent page was served instead of results      |
 | 500    | `INTERNAL_ERROR`       | Unexpected server error                           |
 
 ### `GET /health` and `GET /api/health`
@@ -112,12 +111,11 @@ Settings live in `.env` (see `.env.example`):
 | `ALLOWED_ORIGINS`    | empty    | Comma-separated CORS allow-list (empty = any)       |
 | `RATE_LIMIT_WINDOW_MS` | `900000` | Rate-limit window in milliseconds                 |
 | `RATE_LIMIT_MAX`     | `100`    | Requests allowed per window per IP                  |
-| `SEARCH_ENGINE`      | `google` | Primary engine: `google` or `duckduckgo`            |
-| `DUCKDUCKGO_FALLBACK`| `true`   | Fall back to DDG when Google is blocked/unavailable |
 | `MAX_RESULT_PAGES`   | `10`     | Pages to scan (10 ≈ 100 results, max 10)            |
 | `TARGET_ORGANIC_RESULTS` | `100` | Stop after this many organic links (max 100)      |
-| `REQUEST_DELAY_MS`   | `1000`   | Delay between pages (3s minimum via ScraperAPI)     |
+| `REQUEST_DELAY_MS`   | `1200`   | Delay between pages in milliseconds                 |
 | `REQUEST_TIMEOUT_MS` | `15000`  | Outbound request timeout                            |
+| `DDG_PROXY_FALLBACK` | `true`   | Retry blocked direct requests via free Jina Reader  |
 
 ## Project structure
 
@@ -126,7 +124,7 @@ server.js               Express app for local development and traditional hosts
 api/check-rank.js       Vercel Function for POST /api/check-rank
 api/health.js           Vercel Function for GET /api/health
 lib/                    Shared serverless helpers (config, CORS, rate limit, handler)
-utils/scraperHelper.js  Google/DuckDuckGo scraping, parsing, and matching
+utils/scraperHelper.js  DuckDuckGo scraping, parsing, pagination, and matching
 public/index.html       Frontend markup and SEO metadata
 public/styles.css       Dark responsive design system
 public/app.js           Form, fetch, result rendering, toasts
@@ -135,7 +133,7 @@ public/og-image.png     1200×630 social preview image
 
 ## Deployment notes
 
-- **Vercel (free):** see [`VERCEL.md`](VERCEL.md). The API runs as Serverless Functions in `api/`, the UI is served from `public/`, and `vercel.json` handles routing. No build step is required; add `SCRAPER_API_KEY` in the Vercel dashboard.
+- **Vercel (free):** see [`VERCEL.md`](VERCEL.md). The API runs as Serverless Functions in `api/`, the UI is served from `public/`, and `vercel.json` handles routing. No build step is required and no environment variables are mandatory.
 - **Cloudflare Pages (static only):** see [`DEPLOY_CLOUDFLARE.md`](DEPLOY_CLOUDFLARE.md). Static hosting alone cannot run the rank-check API.
 - Before deploying, replace the relative `og:image` and `twitter:image` paths with absolute production URLs (for example `https://your-domain.com/og-image.png`) so social crawlers can fetch the card reliably.
 - Add the production domain to `ALLOWED_ORIGINS` if the API is called cross-origin.
@@ -143,10 +141,11 @@ public/og-image.png     1200×630 social preview image
 
 ## Notes
 
-- Google frequently serves captchas or consent pages to automated traffic. When that happens, the scraper automatically retries the same query on DuckDuckGo and returns `engine: "duckduckgo"` with `fallback: true`.
-- If both providers are blocked, the API maps this to `503 CHALLENGE`; wait about a minute and retry.
+- DuckDuckGo occasionally serves a challenge page to automated traffic. The scraper retries with a fresh browser profile and returns partial results if a later page is blocked.
+- On datacenter hosts such as Vercel, DuckDuckGo may block the outbound IP entirely. With `DDG_PROXY_FALLBACK=true` (the default), a blocked direct request is retried through the free [Jina Reader](https://r.jina.ai/) service, which returns the same DuckDuckGo HTML so parsing and pagination are unchanged. No API key is required.
+- If DuckDuckGo cannot be read either directly or through the proxy, the API maps this to `503 CHALLENGE`; wait about a minute and retry.
 - Rankings vary by region, personalization, and time. Results are a point-in-time snapshot.
-- This project is not affiliated with Google or DuckDuckGo.
+- This project is not affiliated with DuckDuckGo.
 
 ## License
 

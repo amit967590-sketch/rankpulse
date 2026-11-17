@@ -12,9 +12,8 @@ const { checkKeywordRank, ScraperError } = require('./utils/scraperHelper');
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// Deep-scan configuration: each Google/DuckDuckGo HTML page returns roughly
-// 10 organic results, so the 10-page default covers ~100 positions. Deeper
-// scans are not allowed because ScraperAPI credits and latency grow per page.
+// Deep-scan configuration: each DuckDuckGo HTML page returns roughly 10
+// organic results, so the 10-page default covers ~100 positions.
 const DEFAULT_MAX_RESULT_PAGES = 10;
 const MAX_RESULT_PAGES_LIMIT = 10;
 const configuredMaxResultPages = Number(process.env.MAX_RESULT_PAGES);
@@ -22,14 +21,6 @@ const MAX_RESULT_PAGES =
   Number.isFinite(configuredMaxResultPages) && configuredMaxResultPages > 0
     ? Math.min(Math.floor(configuredMaxResultPages), MAX_RESULT_PAGES_LIMIT)
     : DEFAULT_MAX_RESULT_PAGES;
-
-// Google is the primary SERP source. The scraper falls back to DuckDuckGo
-// automatically when Google serves a captcha/consent page or is unavailable.
-const SEARCH_ENGINE =
-  String(process.env.SEARCH_ENGINE || 'google').trim().toLowerCase() ===
-  'duckduckgo'
-    ? 'duckduckgo'
-    : 'google';
 
 // Trust the first proxy so client IPs (and rate limiting) work correctly
 // when the app runs behind a reverse proxy such as nginx or a PaaS router.
@@ -118,8 +109,21 @@ app.post('/api/check-rank', async (req, res) => {
   try {
     const result = await checkKeywordRank(domain, keyword, {
       maxPages: MAX_RESULT_PAGES,
-      engine: SEARCH_ENGINE,
     });
+
+    // DuckDuckGo could not be read (directly or via the proxy). Report an error
+    // instead of a misleading "not found" result.
+    if (result && result.unavailable === true) {
+      const status = ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(result.code)
+        ? 503
+        : 502;
+
+      return res.status(status).json({
+        success: false,
+        code: result.code || 'REQUEST_FAILED',
+        error: result.message || 'The search provider could not be read.',
+      });
+    }
 
     const resultsScanned = Number.isFinite(result.resultsScanned)
       ? result.resultsScanned
@@ -144,8 +148,6 @@ app.post('/api/check-rank', async (req, res) => {
       pagesChecked: result.pagesChecked,
       checkedAt: result.checkedAt,
       message: result.message || null,
-      fallback: result.fallback === true,
-      fallbackFrom: result.fallbackFrom || null,
     });
   } catch (error) {
     if (error instanceof ScraperError) {

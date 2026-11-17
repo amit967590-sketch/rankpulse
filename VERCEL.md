@@ -2,14 +2,14 @@
 
 > **Live now:** <https://rankpulse-teal.vercel.app> — production deployment on the `amit-aa60` team (project `rankpulse`). Verify with <https://rankpulse-teal.vercel.app/api/health>.
 >
-> Production currently runs `SEARCH_ENGINE=duckduckgo` with `SCRAPER_API_KEY` set. Google is **not** used yet: ScraperAPI returns HTTP 500 for the app's Google URL (`udm=14` + `country_code=in` + `render=true`), and Google now serves result links as opaque `/goto?url=CAES...` tokens that `parseGoogleResults` cannot resolve. Remove the `SEARCH_ENGINE` override to switch back once `utils/scraperHelper.js` handles that markup.
+> Production scrapes DuckDuckGo's HTML endpoint directly. No scraping provider or API key is used; the only optional variables are page caps and rate limits.
 
 The Express app was split into Vercel-compatible pieces:
 
 - **Static frontend** → served from `public/` (no build step)
 - **API** → `/api/check-rank` and `/api/health` as Node.js Serverless Functions
 - **Shared logic** → `lib/` (validation, CORS, rate limiting, time budget)
-- **Scraper** → `utils/scraperHelper.js`, unchanged
+- **Scraper** → `utils/scraperHelper.js` (direct DuckDuckGo HTML scraping)
 
 `server.js` is untouched and still runs the old Express app locally with `npm start`.
 
@@ -56,7 +56,7 @@ POST /api/check-rank
 { "domain": "example.com", "keyword": "example keyword" }
 ```
 
-Success returns the same fields the frontend already reads: `success`, `found`, `position`, `page`, `url`, `title`, `snippet`, `resultsScanned`, `scannedResults`, `pagesChecked`, `checkedAt`, `fallback`.
+Success returns the same fields the frontend already reads: `success`, `found`, `position`, `page`, `url`, `title`, `snippet`, `resultsScanned`, `scannedResults`, `pagesChecked`, `checkedAt`.
 
 ### Frontend configuration
 
@@ -77,25 +77,23 @@ That is why there is no `API_BASE_URL` constant to maintain. Same-origin also me
 
 | Variable | Code default | Required on Vercel? |
 | --- | --- | --- |
-| `SCRAPER_API_KEY` | — | **Yes in practice.** Google blocks datacenter IPs with its JS retry page; the key routes SERP requests through ScraperAPI. |
-| `SEARCH_ENGINE` | `google` | No. `google` or `duckduckgo`. |
-| `DUCKDUCKGO_FALLBACK` | `true` | No. Set `false` to keep Google as the only source. |
 | `MAX_RESULT_PAGES` | `10` | No. 10 pages ≈ 100 organic results. Hard cap 10. |
 | `TARGET_ORGANIC_RESULTS` | `100` | No. Stop after this many organic links. Cap 100. |
-| `SCRAPER_RETRIES` | `0` | No. Keep `0` on Vercel: a retry doubles worst-case latency. |
+| `SCRAPER_RETRIES` | `1` | No. Retries per page after a transient block; `0`–`2`. |
 | `API_TIME_BUDGET_MS` | `280000` | No. Internal deadline; must stay below `maxDuration` (300s). |
-| `REQUEST_TIMEOUT_MS` | `15000` | No. Per-request timeout for direct scrapes (ScraperAPI requests use at least 60s). |
-| `REQUEST_DELAY_MS` | `1000` | No. Delay between SERP pages (ScraperAPI raises it to ~3s). |
+| `REQUEST_TIMEOUT_MS` | `15000` | No. Per-request timeout for direct DuckDuckGo scrapes. |
+| `REQUEST_DELAY_MS` | `1200` | No. Delay between SERP pages. |
+| `DDG_PROXY_FALLBACK` | `true` | No. Retry blocked direct requests through the free Jina Reader proxy. No API key required. |
 | `ALLOWED_ORIGINS` | empty = allow all | No. Comma-separated list if you want to lock the API to specific domains. |
 | `RATE_LIMIT_WINDOW_MS` | `900000` | No. 15 minutes. |
 | `RATE_LIMIT_MAX` | `60` | No. Requests per IP per window. |
 
-Do **not** add `PORT` or `NODE_ENV`; Vercel manages both.
+Do **not** add `PORT` or `NODE_ENV`; Vercel manages both. No scraping API key is required.
 
-Copy-paste for the CLI (run once per variable):
+Copy-paste for the CLI (run once per variable, only if you want to override a default):
 
 ```powershell
-& 'C:\Program Files\nodejs\npx.cmd' vercel@latest env add SCRAPER_API_KEY production
+& 'C:\Program Files\nodejs\npx.cmd' vercel@latest env add MAX_RESULT_PAGES production
 ```
 
 ---
@@ -125,7 +123,7 @@ cd E:\Project_software\Keywords_checker
    - **Build Command:** leave empty
    - **Output Directory:** `public`
    - **Install Command:** leave default
-4. Open **Environment Variables** and add at least `SCRAPER_API_KEY`.
+4. Open **Environment Variables** only if you want to override defaults. No scraping API key is needed.
 5. Click **Deploy**.
 6. You get `https://<project>.vercel.app`.
 
@@ -171,12 +169,12 @@ First run asks a few questions:
 | Directory? | `./` |
 | Override settings? | `N` — `vercel.json` already has them |
 
-### 5.3 Add environment variables, then redeploy
+### 5.3 Optional environment variables, then redeploy
 
-Environment variables are read at deploy time; after adding one, deploy again.
+Environment variables are read at deploy time; after changing one, deploy again.
 
 ```powershell
-& 'C:\Program Files\nodejs\npx.cmd' vercel@latest env add SCRAPER_API_KEY production
+& 'C:\Program Files\nodejs\npx.cmd' vercel@latest env add MAX_RESULT_PAGES production
 & 'C:\Program Files\nodejs\npx.cmd' vercel@latest --prod
 ```
 
@@ -203,13 +201,14 @@ Open `https://<project>.vercel.app/api/health` (or `/health`). Expected:
   "engine": "duckduckgo",
   "maxPages": 10,
   "targetResults": 100,
-  "scraperApiConfigured": true,
+  "retries": 1,
+  "proxyFallback": true,
   "timeBudgetMs": 280000,
   "region": "iad1"
 }
 ```
 
-`scraperApiConfigured: false` means the key is missing or you did not redeploy after adding it.
+`engine: "duckduckgo"` confirms the free direct scraper is deployed. `proxyFallback: true` means blocked direct requests are retried through Jina Reader.
 
 ### 6.2 A real check
 
@@ -260,7 +259,9 @@ Vercel Hobby is free and does not require a card for this setup:
 | Static requests | Served from the CDN within the Hobby allowance |
 | Cost | $0 |
 
-Each rank check is **one function invocation**. ScraperAPI has its own free credit allowance — `render=true` costs more credits per page, and each scan requests up to `MAX_RESULT_PAGES` pages. A 10-page DuckDuckGo scan stops as soon as 100 organic links are read or the time budget runs out, so credits are not spent on pages that can no longer change the result.
+Each rank check is **one function invocation**. DuckDuckGo's HTML endpoint is free, and each scan requests up to `MAX_RESULT_PAGES` pages. A 10-page scan stops as soon as 100 organic links are read or the time budget runs out, so requests are not spent on pages that can no longer change the result.
+
+Vercel's datacenter IPs are sometimes blocked by DuckDuckGo outright. With `DDG_PROXY_FALLBACK=true` (the default) the scraper retries a blocked request through the free [Jina Reader](https://r.jina.ai/) service, which returns the same DuckDuckGo HTML from its own IPs. It needs no API key and is used only after a direct request fails; the rest of that scan then stays on the proxy.
 
 `maxDuration` is 300s in `vercel.json`. The handler aborts itself at `API_TIME_BUDGET_MS` (280s) and the scraper stops paging 45s earlier, returning partial results (with `pagesChecked`/`resultsScanned`) instead of hitting a platform timeout.
 
@@ -271,10 +272,8 @@ Each rank check is **one function invocation**. ScraperAPI has its own free cred
 | Symptom | Cause / fix |
 | --- | --- |
 | `404` on `/api/check-rank` | `api/` folder was not deployed, or the project root is wrong. Confirm the deployment's **Functions** tab lists `api/check-rank`. |
-| `503 CHALLENGE` / "JavaScript-only retry page" | Google blocks the function's IP. Add `SCRAPER_API_KEY` and redeploy. |
+| `503 CHALLENGE` / "bot challenge" | DuckDuckGo blocked the function's IP and the proxy fallback also failed. Confirm `DDG_PROXY_FALLBACK` is not set to `false`, wait a minute, and retry. Lower `MAX_RESULT_PAGES` if it happens often. |
 | `504 REQUEST_TIMEOUT` | Scan exceeded the time budget. Lower `MAX_RESULT_PAGES` or `TARGET_ORGANIC_RESULTS`, or raise `maxDuration` and `API_TIME_BUDGET_MS` together. |
-| `scraperApiConfigured: false` | Env var added after the last build. Redeploy (`vercel --prod` or "Redeploy" in the dashboard). |
-| `502 NO_CREDITS` | The ScraperAPI monthly credit allowance is used up. Add credits / enable overages, wait for the plan to reset, or lower `MAX_RESULT_PAGES`. |
 | `403 ORIGIN_NOT_ALLOWED` | `ALLOWED_ORIGINS` is set and does not include the site's domain. Add it or clear the variable. |
 | `429 RATE_LIMITED` | Hit `RATE_LIMIT_MAX` from one IP. Raise it or wait for the window to reset. |
 | Blank page / 404 on assets | Output directory is wrong. It must be `public` (set in `vercel.json`). |
@@ -288,4 +287,4 @@ Each rank check is **one function invocation**. ScraperAPI has its own free cred
 - **Custom domain:** Vercel → Project → Settings → Domains → add `rankpulse.yourdomain.com` and point the `CNAME` (or the domain's nameservers) as shown.
 - **Better Open Graph previews:** `public/index.html` uses `og:image` = `/og-image.png`. Social platforms prefer an absolute URL, so after you have a domain, change it to `https://your-domain/og-image.png`.
 - **Shared rate limiting:** the current limiter is per-instance. For strict global limits, back it with Upstash Redis (free tier) inside `lib/rateLimit.js`.
-- **Never** put `SCRAPER_API_KEY` in `public/app.js` — it must stay server-side only.
+- **Never** put secrets in `public/app.js`; the current scraper needs no API key at all.
