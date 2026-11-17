@@ -38,3 +38,5 @@ tmp/
 temp/
 
 .vercel
+.env.local
+.env.*.local

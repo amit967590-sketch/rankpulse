@@ -1,5 +1,7 @@
 # Deploy RankPulse on Vercel (free)
 
+> **Live now:** <https://rankpulse-teal.vercel.app> — production deployment on the `amit-aa60` team (project `rankpulse`). Verify with <https://rankpulse-teal.vercel.app/api/health>.
+
 The Express app was split into Vercel-compatible pieces:
 
 - **Static frontend** → served from `public/` (no build step)
