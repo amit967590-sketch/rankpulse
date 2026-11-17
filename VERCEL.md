@@ -1,6 +1,8 @@
 # Deploy RankPulse on Vercel (free)
 
 > **Live now:** <https://rankpulse-teal.vercel.app> — production deployment on the `amit-aa60` team (project `rankpulse`). Verify with <https://rankpulse-teal.vercel.app/api/health>.
+>
+> Production currently runs `SEARCH_ENGINE=duckduckgo` with `SCRAPER_API_KEY` set. Google is **not** used yet: ScraperAPI returns HTTP 500 for the app's Google URL (`udm=14` + `country_code=in` + `render=true`), and Google now serves result links as opaque `/goto?url=CAES...` tokens that `parseGoogleResults` cannot resolve. Remove the `SEARCH_ENGINE` override to switch back once `utils/scraperHelper.js` handles that markup.
 
 The Express app was split into Vercel-compatible pieces:
 
