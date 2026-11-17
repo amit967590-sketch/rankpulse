@@ -6,7 +6,7 @@ A small Node.js/Express app that checks where a domain ranks in Google search re
 
 - **Google-first rank checks** against live Google organic results
 - **Automatic DuckDuckGo fallback** when Google serves a captcha, consent page, or is unavailable
-- **Deep SERP scans** — 5 pages by default (~50 organic results), configurable up to 10 pages (~100 results), so lower-ranking domains are still found
+- **Deep SERP scans** — 10 pages by default (~100 organic results, configurable up to 10 pages), so lower-ranking domains are still found
 - **Position and page** for the matched result (or a clear “not found” state with scan counts)
 - **Smart request handling** — randomized browser headers, user-agent rotation, and jittered pacing
 - **Polished dark UI** with responsive layouts, loading states, result cards, and error toasts
@@ -53,9 +53,9 @@ Successful response:
   "url": "https://expressjs.com/",
   "title": "Express.js · Node.js web application framework",
   "snippet": "Fast, unopinionated, minimalist web framework for Node.js",
-  "resultsScanned": 30,
-  "scannedResults": 30,
-  "pagesChecked": 3,
+  "resultsScanned": 10,
+  "scannedResults": 10,
+  "pagesChecked": 1,
   "checkedAt": "2026-11-04T09:03:00.000Z",
   "message": null,
   "fallback": false
@@ -70,9 +70,9 @@ When the domain is not found, the endpoint still returns `200` with a clear mess
   "found": false,
   "engine": "google",
   "position": null,
-  "resultsScanned": 50,
-  "pagesChecked": 5,
-  "message": "No match found for \"example.com\" after scanning 50 organic results across 5 pages on Google."
+  "resultsScanned": 100,
+  "pagesChecked": 10,
+  "message": "No match found for \"example.com\" after scanning 100 organic results across 10 pages on Google."
 }
 ```
 
@@ -115,6 +115,7 @@ Settings live in `.env` (see `.env.example`):
 | `SEARCH_ENGINE`      | `google` | Primary engine: `google` or `duckduckgo`            |
 | `DUCKDUCKGO_FALLBACK`| `true`   | Fall back to DDG when Google is blocked/unavailable |
 | `MAX_RESULT_PAGES`   | `10`     | Pages to scan (10 ≈ 100 results, max 10)            |
+| `TARGET_ORGANIC_RESULTS` | `100` | Stop after this many organic links (max 100)      |
 | `REQUEST_DELAY_MS`   | `1000`   | Delay between pages (3s minimum via ScraperAPI)     |
 | `REQUEST_TIMEOUT_MS` | `15000`  | Outbound request timeout                            |
 

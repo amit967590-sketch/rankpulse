@@ -299,6 +299,15 @@
       };
     }
 
+    if (error.code === 'NO_CREDITS') {
+      return {
+        title: 'Scan credits exhausted',
+        message:
+          error.message ||
+          'The scraping service has no credits left for this billing cycle. Try again after the plan resets.',
+      };
+    }
+
     if (
       error.code === 'HTTP_ERROR' ||
       error.code === 'REQUEST_FAILED' ||

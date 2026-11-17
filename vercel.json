@@ -4,7 +4,7 @@
   "outputDirectory": "public",
   "functions": {
     "api/check-rank.js": {
-      "maxDuration": 120
+      "maxDuration": 300
     },
     "api/health.js": {
       "maxDuration": 15

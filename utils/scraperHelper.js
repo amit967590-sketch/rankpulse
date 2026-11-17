@@ -26,9 +26,30 @@ const DUCKDUCKGO_ORIGIN = 'https://html.duckduckgo.com';
 // Google shows 10 organic results per HTML result page.
 const GOOGLE_RESULTS_PER_PAGE = 10;
 
-// Collect up to 100 organic links (ten Google result pages) per check. The
-// scan stops early as soon as the target domain is matched.
+// Collect up to 100 organic links (ten result pages) per check. The scan stops
+// early as soon as the target domain is matched.
 const TARGET_ORGANIC_RESULTS = 100;
+
+// Both engines show roughly ten organic results per HTML page.
+const DUCKDUCKGO_RESULTS_PER_PAGE = 10;
+
+// A paged scan stops when less than this much time is left, so an in-flight
+// request can still finish and the caller receives partial results instead of
+// a hard timeout.
+const MIN_PAGE_BUDGET_MS = 10000;
+
+function nowMs() {
+  return Date.now();
+}
+
+function isAbortError(error, signal) {
+  return (
+    Boolean(signal?.aborted) ||
+    error?.name === 'AbortError' ||
+    error?.name === 'CanceledError' ||
+    error?.code === 'ERR_CANCELED'
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -750,23 +771,72 @@ function extractNextPageForm($) {
   return null;
 }
 
-function buildPageRequest(form) {
-  const actionUrl = new URL(form.action, DUCKDUCKGO_ORIGIN);
+/**
+ * Build the DuckDuckGo HTML endpoint URL for a result offset.
+ *
+ * DuckDuckGo accepts an `s` offset on the HTML endpoint, but it only honours it
+ * when the `vqd` token from the first page is supplied; without the token the
+ * offset is ignored and page 1 is served again. The remaining parameters mirror
+ * the hidden fields of DDG's own "Next" form so the markup stays identical.
+ */
+function buildDuckDuckGoPageUrl(query, offset = 0, vqd = '') {
+  const url = new URL(DUCKDUCKGO_SEARCH_URL);
+  url.searchParams.set('q', query);
 
-  if (form.method === 'get') {
-    const params = new URLSearchParams();
-    for (const [name, value] of Object.entries(form.fields)) {
-      params.set(name, value);
-    }
-    actionUrl.search = params.toString();
-    return { method: 'GET', url: actionUrl.toString(), data: undefined };
+  if (offset > 0) {
+    url.searchParams.set('s', String(offset));
+    url.searchParams.set('dc', String(offset + 1));
+    url.searchParams.set('v', 'l');
+    url.searchParams.set('o', 'json');
+    url.searchParams.set('api', 'd.js');
+    if (vqd) url.searchParams.set('vqd', vqd);
   }
 
-  return {
-    method: 'POST',
-    url: actionUrl.toString(),
-    data: new URLSearchParams(form.fields).toString(),
-  };
+  return url.toString();
+}
+
+/**
+ * Pull DuckDuckGo's `vqd` token out of a results page. Current responses keep
+ * it in the hidden next-page form; some variants only expose it in links or
+ * inline script, so fall back to those.
+ */
+function extractDuckDuckGoVqd($, html) {
+  let vqd = '';
+
+  $('input[name="vqd"]').each((_, input) => {
+    if (vqd) return;
+    const value = cleanText($(input).attr('value'));
+    if (value) vqd = value;
+  });
+
+  if (vqd) return vqd;
+
+  const text = String(html || '');
+  const match =
+    text.match(/[?&;]vqd=([\w-]+)/) ||
+    text.match(/"vqd"\s*:\s*"([\w-]+)"/) ||
+    text.match(/vqd=['"]([\w-]+)['"]/);
+
+  return match ? match[1] : '';
+}
+
+/**
+ * Work out the result offset for the next DuckDuckGo page. The hidden `s` field
+ * of the next-page form is authoritative; otherwise fall back to the number of
+ * organic results parsed so far.
+ */
+function resolveDuckDuckGoNextOffset($, currentOffset, resultsScanned) {
+  const nextForm = extractNextPageForm($);
+  const formOffset = Number(nextForm?.fields?.s);
+
+  if (Number.isFinite(formOffset) && formOffset > currentOffset) {
+    return formOffset;
+  }
+
+  return Math.max(
+    currentOffset + DUCKDUCKGO_RESULTS_PER_PAGE,
+    resultsScanned
+  );
 }
 
 function buildGoogleSearchUrl(query, start = 0) {
@@ -883,6 +953,20 @@ async function requestPage({
         throw new ScraperError(
           'ScraperAPI rejected the request (HTTP 401) - check SCRAPER_API_KEY.',
           { code: 'AUTH', status }
+        );
+      }
+
+      // ScraperAPI reports an exhausted monthly quota as HTTP 403 with an
+      // explanatory body. Surface it as its own code so the UI does not claim
+      // the search engine rate-limited us.
+      if (
+        viaScraperApi &&
+        status === 403 &&
+        /exhausted the API Credits|credit limit/i.test(html)
+      ) {
+        throw new ScraperError(
+          'ScraperAPI has no credits left for this billing cycle, so search results could not be fetched.',
+          { code: 'NO_CREDITS', status }
         );
       }
 
@@ -1016,7 +1100,11 @@ function buildNotFoundResult({
       `${resultsScanned} organic ${resultWord} across ${pagesChecked} ` +
       `${pageWord} on ${engineLabel(engine)}.` +
       (partialReason
-        ? ' The scan stopped early because the search provider started rate-limiting requests.'
+        ? partialReason === 'TIME_BUDGET'
+          ? ' The scan stopped early to stay inside the request time limit.'
+          : partialReason === 'PAGINATION_UNAVAILABLE'
+            ? ' The scan stopped early because the search provider did not return a pagination token.'
+            : ' The scan stopped early because the search provider started rate-limiting requests.'
         : ''),
   };
 }
@@ -1028,6 +1116,10 @@ const BLOCKED_MESSAGE =
 const UNAVAILABLE_MESSAGE =
   'Search results could not be fetched right now, so the ranking could not be ' +
   'measured. Please try again in a minute.';
+
+const NO_CREDITS_MESSAGE =
+  'The scraping provider has no credits left for this billing cycle, so the ' +
+  'ranking could not be measured. Add credits or wait for the plan to reset.';
 
 /**
  * Soft failure: the ranking is not claimed, but callers still receive a normal
@@ -1080,16 +1172,27 @@ async function scanGoogle({
   includeSubdomains,
   signal,
   checkedAt,
+  deadlineAt,
+  minPageBudgetMs,
 }) {
   const seenUrls = new Set();
   let resultsScanned = 0;
   let pagesChecked = 0;
   let startPosition = 1;
   let referer;
-  let partialReason;
+  let partialReason = null;
 
   for (let page = 1; page <= maxPages; page += 1) {
     if (page > 1) {
+      const remainingMs = deadlineAt ? deadlineAt - nowMs() : Infinity;
+
+      // Return the pages already collected instead of losing everything to the
+      // caller's hard timeout.
+      if (remainingMs < minPageBudgetMs) {
+        partialReason = 'TIME_BUDGET';
+        break;
+      }
+
       // Small jitter makes page-to-page timing less mechanical.
       await sleep(requestDelayMs + Math.floor(Math.random() * 500));
     }
@@ -1113,6 +1216,8 @@ async function scanGoogle({
         signal,
       });
     } catch (error) {
+      if (isAbortError(error, signal)) throw error;
+
       // Page 1 failing means Google is unusable right now, so let the caller
       // try the fallback engine. Once earlier pages are already scanned, a
       // rate limit should only end the deep scan: keep the work done so far.
@@ -1166,7 +1271,8 @@ async function scanGoogle({
       }
     }
 
-    // We only need up to 30 organic links (three result pages).
+    // Stop as soon as enough organic links were read (default: 100 links from
+    // ten pages), which also bounds ScraperAPI credit usage.
     if (resultsScanned >= targetResults) break;
 
     if (page >= maxPages) break;
@@ -1193,46 +1299,71 @@ async function scanDuckDuckGo({
   query,
   targetDomain,
   maxPages,
+  targetResults,
   requestDelayMs,
   timeoutMs,
   retries,
   includeSubdomains,
   signal,
   checkedAt,
+  deadlineAt,
+  minPageBudgetMs,
 }) {
-  const searchUrl = new URL(DUCKDUCKGO_SEARCH_URL);
-  searchUrl.searchParams.set('q', query);
-
-  let request = {
-    method: 'GET',
-    url: searchUrl.toString(),
-    data: undefined,
-    referer: undefined,
-    origin: undefined,
-  };
-
   const seenUrls = new Set();
   let resultsScanned = 0;
   let pagesChecked = 0;
   let startPosition = 1;
+  let offset = 0;
+  let vqd = '';
+  let partialReason = null;
+  let referer;
 
   for (let page = 1; page <= maxPages; page += 1) {
     if (page > 1) {
+      const remainingMs = deadlineAt ? deadlineAt - nowMs() : Infinity;
+
+      // Finish with the pages already collected rather than letting the caller
+      // abort mid-request and lose everything.
+      if (remainingMs < minPageBudgetMs) {
+        partialReason = 'TIME_BUDGET';
+        break;
+      }
+
       // Small jitter makes page-to-page timing less mechanical.
       await sleep(requestDelayMs + Math.floor(Math.random() * 500));
     }
 
-    const html = await requestPage({
-      engine: 'duckduckgo',
-      ...request,
-      timeoutMs,
-      retries,
-      signal,
-    });
+    let html;
+    const pageUrl = buildDuckDuckGoPageUrl(query, offset, vqd);
+
+    try {
+      html = await requestPage({
+        engine: 'duckduckgo',
+        method: 'GET',
+        url: pageUrl,
+        data: undefined,
+        referer,
+        origin: page > 1 ? DUCKDUCKGO_ORIGIN : undefined,
+        timeoutMs,
+        retries,
+        signal,
+      });
+    } catch (error) {
+      if (isAbortError(error, signal)) throw error;
+
+      // Page 1 failing means DuckDuckGo is unusable right now. Once earlier
+      // pages are already scanned, a rate limit should only end the deep scan.
+      if (page === 1) throw error;
+
+      partialReason = error.code || 'REQUEST_FAILED';
+      break;
+    }
 
     pagesChecked = page;
 
     const $ = cheerio.load(html);
+    if (!vqd) vqd = extractDuckDuckGoVqd($, html);
+
     const { results, organicCount } = parseResults(
       $,
       page,
@@ -1271,28 +1402,23 @@ async function scanDuckDuckGo({
       }
     }
 
+    // Stop as soon as enough organic links were read, or when the page cap is
+    // reached. This keeps ScraperAPI credit usage bounded.
+    if (resultsScanned >= targetResults) break;
     if (page >= maxPages) break;
 
-    // ScraperAPI only fetches a URL with GET, while DuckDuckGo's later pages
-    // are a POST of the hidden next-page form. A proxied fallback therefore
-    // stops after the first page instead of exposing this server's IP.
-    if (getScraperApiKey()) break;
+    // No next-page form means DuckDuckGo has no further results to serve.
+    if (!extractNextPageForm($)) break;
 
-    const nextForm = extractNextPageForm($);
-    if (!nextForm) break;
-
-    // DDG's hidden "s" field is the number of results already shown, so it
-    // gives us the exact offset for the next page (10, 25, 40, ...).
-    const nextOffset = Number(nextForm.fields.s);
-    if (Number.isFinite(nextOffset) && nextOffset >= 0) {
-      startPosition = Math.max(startPosition, nextOffset + 1);
+    // DuckDuckGo ignores the offset without the per-query `vqd` token and would
+    // serve page 1 again, so a missing token ends the deep scan.
+    if (!vqd) {
+      partialReason = 'PAGINATION_UNAVAILABLE';
+      break;
     }
 
-    request = {
-      ...buildPageRequest(nextForm),
-      referer: searchUrl.toString(),
-      origin: DUCKDUCKGO_ORIGIN,
-    };
+    offset = resolveDuckDuckGoNextOffset($, offset, resultsScanned);
+    referer = pageUrl;
   }
 
   return buildNotFoundResult({
@@ -1302,6 +1428,7 @@ async function scanDuckDuckGo({
     resultsScanned,
     pagesChecked,
     checkedAt,
+    partialReason,
   });
 }
 
@@ -1325,6 +1452,7 @@ async function scanDuckDuckGo({
  * @param {number} [options.requestDelayMs]           Delay between page requests in ms (default: REQUEST_DELAY_MS or 1000, raised to 3000 while paging through ScraperAPI).
  * @param {number} [options.timeoutMs]                Per-request timeout in ms (default: REQUEST_TIMEOUT_MS or 15000).
  * @param {number} [options.retries]                  Retry attempts per page request (default: 1).
+ * @param {number} [options.timeBudgetMs]             Soft scan deadline in ms; paging stops early and returns partial results when time runs out (default: none).
  * @param {boolean} [options.includeSubdomains]       Match subdomains too (default: true).
  * @param {'google'|'duckduckgo'} [options.engine]    Primary engine (default: SEARCH_ENGINE or google).
  * @param {boolean} [options.fallbackToDuckDuckGo]    Fall back to DDG when Google is blocked or empty (default: true).
@@ -1398,6 +1526,17 @@ async function runKeywordCheck(domain, keyword, options = {}) {
   const retries = toNonNegativeInt(options.retries, DEFAULTS.retries);
   const includeSubdomains = options.includeSubdomains !== false;
   const signal = options.signal;
+
+  // Soft deadline: the scanner stops starting new pages once the remaining
+  // time cannot cover one more request, so the caller gets partial results
+  // before its hard AbortSignal fires.
+  const timeBudgetMs = toNonNegativeInt(options.timeBudgetMs, 0);
+  const deadlineAt =
+    timeBudgetMs > 0 ? nowMs() + timeBudgetMs : null;
+  const minPageBudgetMs = getScraperApiKey()
+    ? Math.max(SCRAPER_API_MIN_TIMEOUT_MS + 5000, MIN_PAGE_BUDGET_MS)
+    : Math.max(timeoutMs + 5000, MIN_PAGE_BUDGET_MS);
+
   const primaryEngine = normalizeEngine(
     options.engine === undefined ? DEFAULTS.engine : options.engine
   );
@@ -1430,6 +1569,8 @@ async function runKeywordCheck(domain, keyword, options = {}) {
         includeSubdomains,
         signal,
         checkedAt,
+        deadlineAt,
+        minPageBudgetMs,
       });
 
       if (attempts.length > 0) {
@@ -1466,19 +1607,27 @@ async function runKeywordCheck(domain, keyword, options = {}) {
 
   const lastAttempt = attempts[attempts.length - 1];
   const blockedAttempt =
+    attempts.find((attempt) => attempt.code === 'NO_CREDITS') ||
     attempts.find((attempt) =>
       ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(attempt.code)
-    ) || lastAttempt;
+    ) ||
+    lastAttempt;
+
+  const finalCode = blockedAttempt?.code || 'REQUEST_FAILED';
+  const message =
+    finalCode === 'NO_CREDITS'
+      ? NO_CREDITS_MESSAGE
+      : ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(finalCode)
+        ? BLOCKED_MESSAGE
+        : UNAVAILABLE_MESSAGE;
 
   return buildUnavailableResult({
     engine: blockedAttempt?.engine || primaryEngine,
     keyword: query,
     targetDomain,
     checkedAt,
-    code: blockedAttempt?.code || 'REQUEST_FAILED',
-    message: ['CHALLENGE', 'BLOCKED', 'CONSENT'].includes(blockedAttempt?.code)
-      ? BLOCKED_MESSAGE
-      : UNAVAILABLE_MESSAGE,
+    code: finalCode,
+    message,
   });
 }
 
@@ -1490,6 +1639,9 @@ module.exports = {
   parseResults,
   parseGoogleResults,
   extractNextPageForm,
+  buildDuckDuckGoPageUrl,
+  extractDuckDuckGoVqd,
+  resolveDuckDuckGoNextOffset,
   resolveResultUrl,
   matchesDomain,
   buildHeaders,

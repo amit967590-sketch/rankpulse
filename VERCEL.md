@@ -80,10 +80,10 @@ That is why there is no `API_BASE_URL` constant to maintain. Same-origin also me
 | `SCRAPER_API_KEY` | — | **Yes in practice.** Google blocks datacenter IPs with its JS retry page; the key routes SERP requests through ScraperAPI. |
 | `SEARCH_ENGINE` | `google` | No. `google` or `duckduckgo`. |
 | `DUCKDUCKGO_FALLBACK` | `true` | No. Set `false` to keep Google as the only source. |
-| `MAX_RESULT_PAGES` | `3` | No. 3 pages ≈ 30 organic results. Hard cap 10. |
-| `TARGET_ORGANIC_RESULTS` | `30` | No. Stop after this many organic links. Cap 50. |
+| `MAX_RESULT_PAGES` | `10` | No. 10 pages ≈ 100 organic results. Hard cap 10. |
+| `TARGET_ORGANIC_RESULTS` | `100` | No. Stop after this many organic links. Cap 100. |
 | `SCRAPER_RETRIES` | `0` | No. Keep `0` on Vercel: a retry doubles worst-case latency. |
-| `API_TIME_BUDGET_MS` | `110000` | No. Internal deadline; must stay below `maxDuration` (120s). |
+| `API_TIME_BUDGET_MS` | `280000` | No. Internal deadline; must stay below `maxDuration` (300s). |
 | `REQUEST_TIMEOUT_MS` | `15000` | No. Per-request timeout for direct scrapes (ScraperAPI requests use at least 60s). |
 | `REQUEST_DELAY_MS` | `1000` | No. Delay between SERP pages (ScraperAPI raises it to ~3s). |
 | `ALLOWED_ORIGINS` | empty = allow all | No. Comma-separated list if you want to lock the API to specific domains. |
@@ -200,11 +200,11 @@ Open `https://<project>.vercel.app/api/health` (or `/health`). Expected:
 {
   "status": "ok",
   "runtime": "vercel",
-  "engine": "google",
-  "maxPages": 3,
-  "targetResults": 30,
+  "engine": "duckduckgo",
+  "maxPages": 10,
+  "targetResults": 100,
   "scraperApiConfigured": true,
-  "timeBudgetMs": 110000,
+  "timeBudgetMs": 280000,
   "region": "iad1"
 }
 ```
@@ -254,15 +254,15 @@ Vercel Hobby is free and does not require a card for this setup:
 
 | Item | Hobby limit |
 | --- | --- |
-| Function max duration | 300s (this project sets 120s) |
+| Function max duration | 300s (this project sets 300s) |
 | Function memory | 2 GB / 1 vCPU |
 | Deployments per day | 100 |
 | Static requests | Served from the CDN within the Hobby allowance |
 | Cost | $0 |
 
-Each rank check is **one function invocation**. ScraperAPI has its own free credit allowance — `render=true` costs more credits per page, and each scan requests up to `MAX_RESULT_PAGES` pages. Keep the page cap at 3 for the free tier.
+Each rank check is **one function invocation**. ScraperAPI has its own free credit allowance — `render=true` costs more credits per page, and each scan requests up to `MAX_RESULT_PAGES` pages. A 10-page DuckDuckGo scan stops as soon as 100 organic links are read or the time budget runs out, so credits are not spent on pages that can no longer change the result.
 
-`maxDuration` is 120s in `vercel.json`. The handler aborts itself at `API_TIME_BUDGET_MS` (110s) and returns a clean `504 REQUEST_TIMEOUT` JSON response instead of a platform timeout.
+`maxDuration` is 300s in `vercel.json`. The handler aborts itself at `API_TIME_BUDGET_MS` (280s) and the scraper stops paging 45s earlier, returning partial results (with `pagesChecked`/`resultsScanned`) instead of hitting a platform timeout.
 
 ---
 
@@ -272,8 +272,9 @@ Each rank check is **one function invocation**. ScraperAPI has its own free cred
 | --- | --- |
 | `404` on `/api/check-rank` | `api/` folder was not deployed, or the project root is wrong. Confirm the deployment's **Functions** tab lists `api/check-rank`. |
 | `503 CHALLENGE` / "JavaScript-only retry page" | Google blocks the function's IP. Add `SCRAPER_API_KEY` and redeploy. |
-| `504 REQUEST_TIMEOUT` | Scan exceeded the time budget. Lower `MAX_RESULT_PAGES` to `2`, or raise `maxDuration` and `API_TIME_BUDGET_MS` together. |
+| `504 REQUEST_TIMEOUT` | Scan exceeded the time budget. Lower `MAX_RESULT_PAGES` or `TARGET_ORGANIC_RESULTS`, or raise `maxDuration` and `API_TIME_BUDGET_MS` together. |
 | `scraperApiConfigured: false` | Env var added after the last build. Redeploy (`vercel --prod` or "Redeploy" in the dashboard). |
+| `502 NO_CREDITS` | The ScraperAPI monthly credit allowance is used up. Add credits / enable overages, wait for the plan to reset, or lower `MAX_RESULT_PAGES`. |
 | `403 ORIGIN_NOT_ALLOWED` | `ALLOWED_ORIGINS` is set and does not include the site's domain. Add it or clear the variable. |
 | `429 RATE_LIMITED` | Hit `RATE_LIMIT_MAX` from one IP. Raise it or wait for the window to reset. |
 | Blank page / 404 on assets | Output directory is wrong. It must be `public` (set in `vercel.json`). |
